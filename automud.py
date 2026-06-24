@@ -25,9 +25,8 @@ What the daemon does for you:
     (Char.Vitals, Room.Info, etc.) into JSON you can read with `state`. It refuses every
     other option it doesn't understand (compression, MSDP, MXP) rather than choking on it.
 
-The control channel is a localhost-only socket with no authentication: anyone able to run
-processes as you on this machine can drive the session. That is fine for a personal box;
-on a shared host, treat a live session as readable/writable by other local users.
+The control channel is a localhost-only socket gated by a per-session token kept in a
+private (0700) state directory, so only processes running as you can drive the session.
 
 Config (optional):
     AUTOMUD_DIR : session/state directory (default: <tempdir>/automud)
@@ -39,6 +38,7 @@ import codecs
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -84,12 +84,28 @@ def strip_ansi(text: str) -> str:
 
 # ------------------------------ session state files ------------------------------
 
-def _write_session(data: dict) -> None:
+def _ensure_dir() -> None:
     os.makedirs(AUTOMUD_DIR, exist_ok=True)
+    try:
+        os.chmod(AUTOMUD_DIR, 0o700)          # POSIX: keep the state dir private (no-op on Windows)
+    except Exception:
+        pass
+
+
+def _harden(path: str, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
+
+
+def _write_session(data: dict) -> None:
+    _ensure_dir()
     tmp = SESSION_JSON + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
     os.replace(tmp, SESSION_JSON)
+    _harden(SESSION_JSON, 0o600)
 
 
 def _read_session() -> Optional[dict]:
@@ -359,7 +375,7 @@ async def _do_op(req: dict, state: dict, writer: asyncio.StreamWriter) -> dict:
 
 
 async def _daemon_main(host: str, port: int) -> None:
-    os.makedirs(AUTOMUD_DIR, exist_ok=True)
+    _ensure_dir()
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=20.0)
     except Exception as e:
@@ -368,6 +384,7 @@ async def _daemon_main(host: str, port: int) -> None:
 
     try:
         log_fh = open(OUT_LOG, "a", encoding="utf-8")
+        _harden(OUT_LOG, 0o600)
     except Exception:
         log_fh = None
 
@@ -375,14 +392,20 @@ async def _daemon_main(host: str, port: int) -> None:
              "last_rx": time.monotonic(), "prompt_seen": False, "lock": asyncio.Lock()}
     conn = MudConn(writer, state, log_fh)
     stop = asyncio.Event()
+    token = secrets.token_hex(16)            # per-session secret; only our own processes know it
 
     async def control(creader: asyncio.StreamReader, cwriter: asyncio.StreamWriter) -> None:
         op = None
+        authed = False
         try:
             line = await creader.readline()
             req = json.loads(line.decode("utf-8", "replace") or "{}")
-            op = req.get("op")
-            resp = await _do_op(req, state, writer)
+            if secrets.compare_digest(str(req.get("token")), token):
+                authed = True
+                op = req.get("op")
+                resp = await _do_op(req, state, writer)
+            else:
+                resp = {"ok": False, "error": "auth failed"}
             cwriter.write((json.dumps(resp) + "\n").encode("utf-8"))
             await cwriter.drain()
         except Exception as e:
@@ -396,12 +419,13 @@ async def _daemon_main(host: str, port: int) -> None:
                 cwriter.close()
             except Exception:
                 pass
-            if op == "close":                # stop only after the ack has been flushed to the client
+            if authed and op == "close":      # stop only after an authenticated close acks
                 stop.set()
 
     server = await asyncio.start_server(control, "127.0.0.1", 0)
     ctrl_port = server.sockets[0].getsockname()[1]
-    _write_session({"host": host, "port": port, "control_port": ctrl_port, "pid": os.getpid()})
+    _write_session({"host": host, "port": port, "control_port": ctrl_port,
+                    "pid": os.getpid(), "token": token})
 
     async def pump() -> None:
         try:
@@ -439,7 +463,8 @@ def _control(op: str, _timeout: float = 35.0, **kw) -> dict:
     try:
         with socket.create_connection(("127.0.0.1", sess["control_port"]), timeout=_timeout) as s:
             s.settimeout(_timeout)
-            s.sendall((json.dumps({"op": op, **kw}) + "\n").encode("utf-8"))
+            req = {"op": op, "token": sess.get("token", ""), **kw}
+            s.sendall((json.dumps(req) + "\n").encode("utf-8"))
             buf = b""
             while not buf.endswith(b"\n"):
                 chunk = s.recv(65536)
@@ -452,14 +477,16 @@ def _control(op: str, _timeout: float = 35.0, **kw) -> dict:
 
 
 def _spawn_daemon(host: str, port: int) -> None:
-    os.makedirs(AUTOMUD_DIR, exist_ok=True)
+    _ensure_dir()
     try:
         os.remove(SESSION_JSON)
     except Exception:
         pass
     open(OUT_LOG, "w", encoding="utf-8").close()
+    _harden(OUT_LOG, 0o600)
     args = [sys.executable, os.path.abspath(__file__), "--daemon", host, str(port)]
     logf = open(DAEMON_LOG, "w", encoding="utf-8")
+    _harden(DAEMON_LOG, 0o600)
     kwargs: dict = {"stdout": logf, "stderr": logf, "stdin": subprocess.DEVNULL}
     if os.name == "nt":
         kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
