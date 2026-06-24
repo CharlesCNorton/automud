@@ -327,7 +327,7 @@ def _vitals(state: dict) -> dict:
     return v if isinstance(v, dict) else {}
 
 
-async def _do_op(req: dict, state: dict, writer: asyncio.StreamWriter, stop: asyncio.Event) -> dict:
+async def _do_op(req: dict, state: dict, writer: asyncio.StreamWriter) -> dict:
     op = req.get("op")
     quiet = float(req.get("quiet", 0.3))
     maxw = float(req.get("max", 5.0))
@@ -354,8 +354,7 @@ async def _do_op(req: dict, state: dict, writer: asyncio.StreamWriter, stop: asy
                 "unread": state["total"] - state["read"], "total_chars": state["total"],
                 "gmcp_packages": sorted(state["gmcp"].keys()), "vitals": _vitals(state)}
     if op == "close":
-        stop.set()
-        return {"ok": True}
+        return {"ok": True}                  # the control handler stops the daemon after this acks
     return {"ok": False, "error": f"unknown op '{op}'"}
 
 
@@ -378,10 +377,12 @@ async def _daemon_main(host: str, port: int) -> None:
     stop = asyncio.Event()
 
     async def control(creader: asyncio.StreamReader, cwriter: asyncio.StreamWriter) -> None:
+        op = None
         try:
             line = await creader.readline()
             req = json.loads(line.decode("utf-8", "replace") or "{}")
-            resp = await _do_op(req, state, writer, stop)
+            op = req.get("op")
+            resp = await _do_op(req, state, writer)
             cwriter.write((json.dumps(resp) + "\n").encode("utf-8"))
             await cwriter.drain()
         except Exception as e:
@@ -391,7 +392,12 @@ async def _daemon_main(host: str, port: int) -> None:
             except Exception:
                 pass
         finally:
-            cwriter.close()
+            try:
+                cwriter.close()
+            except Exception:
+                pass
+            if op == "close":                # stop only after the ack has been flushed to the client
+                stop.set()
 
     server = await asyncio.start_server(control, "127.0.0.1", 0)
     ctrl_port = server.sockets[0].getsockname()[1]
@@ -613,7 +619,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    if len(sys.argv) >= 2 and sys.argv[1] == "--daemon":
+    # MUD text is UTF-8. Force it on stdout/stderr so non-ASCII output (box drawing, accents,
+    # CJK, emoji) never raises UnicodeEncodeError when the console codepage is narrow or the
+    # output is captured/redirected, which is exactly how an agent runs this.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    if len(sys.argv) >= 4 and sys.argv[1] == "--daemon":
         asyncio.run(_daemon_main(sys.argv[2], int(sys.argv[3])))
         return
 
