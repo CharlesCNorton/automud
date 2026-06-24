@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automud"
-version = "0.1.0"
+version = "0.1.1"
 description = "Persistent telnet/MUD session manager you drive by hand or with an agent. No LLM, no API key."
 readme = "README.md"
 requires-python = ">=3.8"

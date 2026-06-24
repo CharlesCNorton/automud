@@ -7,13 +7,13 @@ normal shell can't: a raw telnet session is interactive and blocking, so it can'
 across separate commands. A small background daemon keeps the connection open and you talk
 to it with discrete verbs:
 
-    python AutoMUD.py connect --demo achaea     # or: connect achaea.com 23
-    python AutoMUD.py send 2                     # send a line, print the reply
-    python AutoMUD.py send Maelvorn
-    python AutoMUD.py recv                        # drain any new output
-    python AutoMUD.py state                       # structured game state (GMCP) as JSON
-    python AutoMUD.py status
-    python AutoMUD.py close
+    automud connect --demo achaea     # or: automud connect achaea.com 23
+    automud send 2                     # send a line, print the reply
+    automud send Maelvorn
+    automud recv                        # drain any new output
+    automud state                       # structured game state (GMCP) as JSON
+    automud status
+    automud close
 
 What the daemon does for you:
   * Smart waiting: send/recv return as soon as the server stops talking (an IAC GA/EOR
@@ -25,12 +25,17 @@ What the daemon does for you:
     (Char.Vitals, Room.Info, etc.) into JSON you can read with `state`. It refuses every
     other option it doesn't understand (compression, MSDP, MXP) rather than choking on it.
 
+The control channel is a localhost-only socket with no authentication: anyone able to run
+processes as you on this machine can drive the session. That is fine for a personal box;
+on a shared host, treat a live session as readable/writable by other local users.
+
 Config (optional):
     AUTOMUD_DIR : session/state directory (default: <tempdir>/automud)
 """
 
 import argparse
 import asyncio
+import codecs
 import json
 import os
 import re
@@ -68,6 +73,9 @@ OPT_GMCP, OPT_EOR = 201, 25
 WANT_DO = {OPT_GMCP, OPT_EOR}
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][AB012]|[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# A trailing, still-incomplete escape sequence (no final byte yet). Held back so a sequence
+# split across two TCP reads is completed before it is emitted or stripped.
+_ANSI_INCOMPLETE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*|[()])?$")
 
 
 def strip_ansi(text: str) -> str:
@@ -117,6 +125,8 @@ class MudConn:
         self.text = bytearray()
         self.him = {}               # server-side option enabled? (None unknown)
         self.us = {}                # our-side option enabled?
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._pending = ""          # decoded text held back across reads (partial escape)
 
     # ---- byte stream ----
     def feed(self, data: bytes) -> None:
@@ -196,8 +206,20 @@ class MudConn:
     def _flush_text(self) -> None:
         if not self.text:
             return
-        s = strip_ansi(self.text.decode("utf-8", "replace"))
+        # Decode incrementally so a multibyte char split across reads is completed, not
+        # turned into a replacement char.
+        self._pending += self._decoder.decode(bytes(self.text))
         self.text = bytearray()
+        emit = self._pending
+        # Hold back a trailing incomplete escape so a sequence split across reads isn't
+        # emitted or mis-stripped; it completes on the next chunk.
+        m = _ANSI_INCOMPLETE.search(emit)
+        if m:
+            self._pending = emit[m.start():]
+            emit = emit[:m.start()]
+        else:
+            self._pending = ""
+        s = strip_ansi(emit)
         if s:
             self._append(s)
 
@@ -300,31 +322,37 @@ def _drain(state: dict) -> str:
     return data
 
 
+def _vitals(state: dict) -> dict:
+    v = state["gmcp"].get("Char.Vitals")
+    return v if isinstance(v, dict) else {}
+
+
 async def _do_op(req: dict, state: dict, writer: asyncio.StreamWriter, stop: asyncio.Event) -> dict:
     op = req.get("op")
     quiet = float(req.get("quiet", 0.3))
     maxw = float(req.get("max", 5.0))
     if op == "send":
-        since = state["total"]
-        state["prompt_seen"] = False
-        try:
-            writer.write((req.get("data") or "").encode("utf-8").replace(b"\xff", b"\xff\xff") + b"\r\n")
-            await writer.drain()
-        except Exception as e:
-            return {"ok": False, "error": f"send failed: {e}"}
-        await _wait_settled(state, since, quiet, maxw)
-        return {"ok": True, "data": _drain(state), "connected": state["connected"]}
+        async with state["lock"]:
+            since = state["total"]
+            state["prompt_seen"] = False
+            try:
+                writer.write((req.get("data") or "").encode("utf-8").replace(b"\xff", b"\xff\xff") + b"\r\n")
+                await writer.drain()
+            except Exception as e:
+                return {"ok": False, "error": f"send failed: {e}"}
+            await _wait_settled(state, since, quiet, maxw)
+            return {"ok": True, "data": _drain(state), "connected": state["connected"]}
     if op == "recv":
-        if req.get("block", True):
-            await _wait_settled(state, state["read"], quiet, maxw)
-        return {"ok": True, "data": _drain(state), "connected": state["connected"]}
+        async with state["lock"]:
+            if req.get("block", True):
+                await _wait_settled(state, state["read"], quiet, maxw)
+            return {"ok": True, "data": _drain(state), "connected": state["connected"]}
     if op == "state":
         return {"ok": True, "gmcp": state["gmcp"], "connected": state["connected"]}
     if op == "status":
-        vit = state["gmcp"].get("Char.Vitals") or {}
         return {"ok": True, "connected": state["connected"],
                 "unread": state["total"] - state["read"], "total_chars": state["total"],
-                "gmcp_packages": sorted(state["gmcp"].keys()), "vitals": vit}
+                "gmcp_packages": sorted(state["gmcp"].keys()), "vitals": _vitals(state)}
     if op == "close":
         stop.set()
         return {"ok": True}
@@ -345,7 +373,7 @@ async def _daemon_main(host: str, port: int) -> None:
         log_fh = None
 
     state = {"buffer": "", "total": 0, "read": 0, "base": 0, "connected": True, "gmcp": {},
-             "last_rx": time.monotonic(), "prompt_seen": False}
+             "last_rx": time.monotonic(), "prompt_seen": False, "lock": asyncio.Lock()}
     conn = MudConn(writer, state, log_fh)
     stop = asyncio.Event()
 
@@ -372,7 +400,10 @@ async def _daemon_main(host: str, port: int) -> None:
     async def pump() -> None:
         try:
             while not stop.is_set():
-                data = await reader.read(4096)
+                try:
+                    data = await reader.read(4096)
+                except (ConnectionError, OSError):
+                    break                                # reset/abort: treat as disconnect
                 if not data:
                     break
                 conn.feed(data)
@@ -395,12 +426,13 @@ async def _daemon_main(host: str, port: int) -> None:
 
 # ------------------------------ client (the verbs) ------------------------------
 
-def _control(op: str, **kw) -> dict:
+def _control(op: str, _timeout: float = 35.0, **kw) -> dict:
     sess = _read_session()
     if not sess or "control_port" not in sess:
         return {"ok": False, "error": "no active session (run 'connect' first)"}
     try:
-        with socket.create_connection(("127.0.0.1", sess["control_port"]), timeout=30) as s:
+        with socket.create_connection(("127.0.0.1", sess["control_port"]), timeout=_timeout) as s:
+            s.settimeout(_timeout)
             s.sendall((json.dumps({"op": op, **kw}) + "\n").encode("utf-8"))
             buf = b""
             while not buf.endswith(b"\n"):
@@ -421,19 +453,26 @@ def _spawn_daemon(host: str, port: int) -> None:
         pass
     open(OUT_LOG, "w", encoding="utf-8").close()
     args = [sys.executable, os.path.abspath(__file__), "--daemon", host, str(port)]
-    logf = open(DAEMON_LOG, "a", encoding="utf-8")
+    logf = open(DAEMON_LOG, "w", encoding="utf-8")
     kwargs: dict = {"stdout": logf, "stderr": logf, "stdin": subprocess.DEVNULL}
     if os.name == "nt":
         kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen(args, **kwargs)
+    try:
+        subprocess.Popen(args, **kwargs)
+    finally:
+        logf.close()                                     # the child has its own inherited handle
 
 
 def _print(text: str) -> None:
     sys.stdout.write(text)
     if text and not text.endswith("\n"):
         sys.stdout.write("\n")
+
+
+def _wait_timeout(maxw: float) -> float:
+    return max(35.0, maxw + 15.0)
 
 
 def cmd_connect(host: str, port: int, quiet: float, maxw: float) -> int:
@@ -459,12 +498,12 @@ def cmd_connect(host: str, port: int, quiet: float, maxw: float) -> int:
         print(f"connect failed: {sess['error']}")
         return 1
     print(f"connected to {host}:{port}")
-    _print(_control("recv", block=True, quiet=quiet, max=maxw).get("data", ""))
+    _print(_control("recv", _timeout=_wait_timeout(maxw), block=True, quiet=quiet, max=maxw).get("data", ""))
     return 0
 
 
 def cmd_send(text: str, quiet: float, maxw: float) -> int:
-    r = _control("send", data=text, quiet=quiet, max=maxw)
+    r = _control("send", _timeout=_wait_timeout(maxw), data=text, quiet=quiet, max=maxw)
     if not r.get("ok"):
         print(f"send failed: {r.get('error')}")
         return 1
@@ -473,7 +512,7 @@ def cmd_send(text: str, quiet: float, maxw: float) -> int:
 
 
 def cmd_recv(quiet: float, maxw: float) -> int:
-    r = _control("recv", block=True, quiet=quiet, max=maxw)
+    r = _control("recv", _timeout=_wait_timeout(maxw), block=True, quiet=quiet, max=maxw)
     if not r.get("ok"):
         print(f"recv failed: {r.get('error')}")
         return 1
@@ -504,7 +543,8 @@ def cmd_status() -> int:
     if not r.get("ok"):
         print(f"no session: {r.get('error')}")
         return 1
-    vit = r.get("vitals") or {}
+    vit = r.get("vitals")
+    vit = vit if isinstance(vit, dict) else {}
     vit_str = f" vitals: hp={vit.get('hp')} mp={vit.get('mp')}" if vit else ""
     print(f"connected={r['connected']} unread={r['unread']} chars "
           f"gmcp=[{', '.join(r.get('gmcp_packages', []))}]" + vit_str)
@@ -534,7 +574,7 @@ def cmd_log(tail: int) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="AutoMUD",
+        prog="automud",
         description="Persistent telnet/MUD session driven by discrete verbs, with smart waiting "
                     "and GMCP capture. No LLM, no API key; the operator supplies the intelligence.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
