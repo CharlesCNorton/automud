@@ -35,7 +35,7 @@ automud close
 | verb | what it does |
 |------|--------------|
 | `connect HOST PORT` / `--demo NAME` | open a session and start the daemon |
-| `send TEXT` | send one line, print what comes back |
+| `send [TEXT]` | send one line, print what comes back (omit TEXT to send a blank line) |
 | `recv` | print any new output |
 | `state [--key PKG]` | captured GMCP state as JSON (e.g. `--key Char.Vitals`) |
 | `status` | connection and vitals summary |

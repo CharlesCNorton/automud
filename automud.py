@@ -52,7 +52,10 @@ OUT_LOG = os.path.join(AUTOMUD_DIR, "out.log")
 DAEMON_LOG = os.path.join(AUTOMUD_DIR, "daemon.log")
 
 # Keep at most this many characters of received text in memory (the full stream still goes
-# to OUT_LOG). Trimming only ever drops already-read history, never unread output.
+# to OUT_LOG, which `log` reads). Trimming drops the oldest buffered text once the buffer
+# exceeds the cap: it prefers already-read history, but a single burst larger than the cap
+# also drops not-yet-read bytes from the in-memory buffer (they survive in OUT_LOG). The
+# read cursor is advanced past anything dropped so nothing is ever re-served.
 BUFFER_CAP = 1_000_000
 
 DEMOS = {
@@ -399,7 +402,7 @@ async def _daemon_main(host: str, port: int) -> None:
         authed = False
         try:
             line = await creader.readline()
-            req = json.loads(line.decode("utf-8", "replace") or "{}")
+            req = json.loads(line.decode("utf-8", "replace").strip() or "{}")
             if secrets.compare_digest(str(req.get("token")), token):
                 authed = True
                 op = req.get("op")
@@ -628,7 +631,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_wait(c)
 
     s = sub.add_parser("send", help="send one line, then print the reply")
-    s.add_argument("text", nargs="+", help="the line to send (joined with spaces)")
+    s.add_argument("text", nargs="*",
+                   help="the line to send (joined with spaces); omit to send a blank line, "
+                        "e.g. to answer a [more] pager or a 'press return' prompt")
     add_wait(s)
 
     r = sub.add_parser("recv", help="print any new output (waits for it to settle)")
