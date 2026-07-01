@@ -571,6 +571,41 @@ class TestFilesAndPids(unittest.TestCase):
             self.assertEqual(automud.cmd_log(tail=0), 1)
 
 
+class TestSites(unittest.TestCase):
+    def test_entries_wellformed(self):
+        self.assertGreaterEqual(len(automud.SITES), 40)
+        for name, (host, port, note) in automud.SITES.items():
+            self.assertEqual(name, name.lower())
+            self.assertNotIn(" ", name)
+            self.assertTrue(host and isinstance(host, str))
+            self.assertTrue(isinstance(port, int) and 1 <= port <= 65535)
+            self.assertTrue(note and isinstance(note, str))
+
+    def test_legacy_demo_names_still_resolve(self):
+        for name, host in (("zork", "telehack.com"), ("chess", "freechess.org"),
+                           ("achaea", "achaea.com")):
+            self.assertEqual(automud.SITES[name][0], host)
+
+    def test_cmd_sites_lists_every_entry(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(automud.cmd_sites(False), 0)
+        text = out.getvalue()
+        for name, (host, port, _) in automud.SITES.items():
+            self.assertIn(name, text)
+            self.assertIn("%s:%d" % (host, port), text)
+
+    def test_cmd_sites_json(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(automud.cmd_sites(True), 0)
+        data = json.loads(out.getvalue())
+        self.assertEqual(set(data), set(automud.SITES))
+        self.assertEqual(data["aardwolf"],
+                         {"host": "aardmud.org", "port": 4000,
+                          "note": automud.SITES["aardwolf"][2]})
+
+
 class TestFinish(unittest.TestCase):
     def test_disconnected_exits_3(self):
         out, err = io.StringIO(), io.StringIO()

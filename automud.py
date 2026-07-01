@@ -7,7 +7,8 @@ normal shell can't: a raw telnet session is interactive and blocking, so it can'
 across separate commands. A small background daemon keeps the connection open and you talk
 to it with discrete verbs:
 
-    automud connect --demo achaea     # or: automud connect achaea.com 23
+    automud sites                      # directory of verified public targets
+    automud connect achaea             # by name, or: automud connect achaea.com 23
     automud send 2                     # send a line, print the reply
     automud send Maelvorn
     automud recv                        # drain any new output
@@ -63,7 +64,7 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 # ------------------------------ state directory ------------------------------
@@ -114,10 +115,60 @@ COMM_HISTORY_CAP = 200
 # but never more than this many characters (so a never-terminated OSC can't pin output).
 PENDING_CAP = 4096
 
-DEMOS = {
-    "zork": ("telehack.com", 23),
-    "chess": ("freechess.org", 5000),
-    "achaea": ("achaea.com", 23),
+# Suggested public targets, every one verified reachable by a live probe (last run
+# 2026-07-01). `connect NAME` or `connect --demo NAME` resolves them; `sites` lists them.
+SITES = {
+    # --- MUDs ---
+    "achaea": ("achaea.com", 23, "Iron Realms fantasy MUD; rich GMCP"),
+    "aetolia": ("aetolia.com", 23, "IRE gothic/vampire MUD; GMCP"),
+    "aardwolf": ("aardmud.org", 4000, "huge, very active hack-and-slash; rich GMCP"),
+    "batmud": ("batmud.bat.org", 23, "Finnish giant, running since 1990"),
+    "discworld": ("discworld.starturtle.net", 4242, "Pratchett's Discworld LPMud"),
+    "3k": ("3k.org", 3000, "3Kingdoms: long-running LPMud, three realms"),
+    "3scapes": ("3scapes.org", 3200, "3Kingdoms' sister LPMud"),
+    "alteraeon": ("alteraeon.com", 3000, "active Diku descendant, blind-player friendly"),
+    "materiamagica": ("materiamagica.com", 4000, "polished quest-heavy fantasy"),
+    "legendmud": ("mud.legendmud.org", 9999, "historical-eras theme, est. 1994"),
+    "medievia": ("medievia.com", 4000, "big classic Diku-style world"),
+    "realmsofdespair": ("realmsofdespair.com", 4000, "home of the SMAUG codebase"),
+    "ancientanguish": ("ancient.anguish.org", 2222, "cozy LPMud, running since 1992"),
+    "twotowers": ("t2tmud.org", 9999, "Tolkien Third Age MUD"),
+    "mume": ("mume.org", 4242, "Multi-Users in Middle-earth, hardcore PvP"),
+    "toril": ("torilmud.org", 9999, "Forgotten Realms, EverQuest's ancestor"),
+    "genesis": ("mud.genesismud.org", 3011, "original LPMud lineage, est. 1989"),
+    "nannymud": ("mud.lysator.liu.se", 2000, "Swedish LPMud, running since 1990"),
+    "threshold": ("thresholdrpg.com", 3333, "roleplay-enforced fantasy, est. 1996"),
+    "dsl": ("dsl-mud.org", 4000, "Dark & Shattered Lands, ROM PK/RP"),
+    "miriani": ("toastsoft.net", 1234, "space sim MOO, starship crews"),
+    "fed2": ("play.federation2.com", 30003, "space trading game from 1985"),
+    "lotj": ("legendsofthejedi.com", 5656, "Star Wars, era-based storytelling"),
+    "morgengrauen": ("mg.mud.de", 4711, "large German-language LPMud"),
+    "ateraan": ("www.ateraan.com", 4002, "New Worlds: Ateraan, roleplay fantasy"),
+    "luminari": ("luminarimud.com", 4100, "Pathfinder/d20-flavored MUD"),
+    "empiremud": ("empiremud.net", 4000, "empire-building MUD"),
+    "igor": ("igormud.org", 1701, "quirky LPMud, running since 1992"),
+    "elephant": ("elephant.org", 23, "Elephant MUD LPMud"),
+    "sloth": ("slothmud.org", 6101, "SlothMUD III, Diku since 1994"),
+    # --- MOOs ---
+    "lambdamoo": ("lambda.moo.mud.org", 8888, "the legendary social MOO"),
+    "sindome": ("moo.sindome.org", 5555, "cyberpunk roleplay MOO"),
+    # --- services ---
+    "telehack": ("telehack.com", 23, "simulated 1980s ARPANET playground"),
+    "zork": ("telehack.com", 23, "Zork on Telehack (type 'zork')"),
+    "fics": ("freechess.org", 5000, "Free Internet Chess Server"),
+    "chess": ("freechess.org", 5000, "alias of fics"),
+    "mapscii": ("mapscii.me", 23, "zoomable ASCII world map"),
+    "starwars": ("towel.blinkenlights.nl", 23, "Star Wars ASCIImation stream"),
+    "nethack": ("nethack.alt.org", 23, "NetHack public server (NAO)"),
+    "horizons": ("ssd.jpl.nasa.gov", 6775, "JPL Horizons ephemeris system"),
+    "sdf": ("sdf.org", 23, "SDF public-access Unix"),
+    "mtrek": ("mtrek.com", 1701, "multiplayer Star Trek combat"),
+    "nist-time": ("time.nist.gov", 13, "NIST daytime; prints the time, disconnects"),
+    # --- BBSes ---
+    "fozztexx": ("bbs.fozztexx.com", 23, "retro BBS"),
+    "particles": ("particlesbbs.dyndns.org", 6400, "Particles! BBS (Commodore)"),
+    "20forbeers": ("20forbeers.com", 1337, "20 For Beers BBS"),
+    "cavebbs": ("cavebbs.homeip.net", 23, "The Cave BBS, Synchronet"),
 }
 
 # Telnet command bytes
@@ -1176,6 +1227,17 @@ def cmd_kill() -> int:
     return 0
 
 
+def cmd_sites(json_mode: bool) -> int:
+    if json_mode:
+        print(json.dumps({n: {"host": h, "port": p, "note": d}
+                          for n, (h, p, d) in SITES.items()}, indent=2))
+        return 0
+    width = max(len(n) for n in SITES)
+    for name, (host, port, note) in SITES.items():
+        print("%-*s  %-33s %s" % (width, name, "%s:%d" % (host, port), note))
+    return 0
+
+
 def cmd_log(tail: int) -> int:
     if not os.path.exists(OUT_LOG):
         print("no session log yet")
@@ -1220,8 +1282,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Persistent telnet/MUD session driven by discrete verbs, with smart waiting "
                     "and GMCP capture. No LLM, no API key; the operator supplies the intelligence.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Verbs: connect / send / recv / wait / gmcp / state / status / log / close / kill.\n"
-               "Demos: " + ", ".join(sorted(DEMOS)) + ".\n"
+        epilog="Verbs: connect / send / recv / wait / gmcp / state / status / log / close / "
+               "kill / sites.\n"
+               "Run 'automud sites' for a directory of verified public targets.\n"
                "Exit codes: 0 ok; 1 failure; 2 usage; 3 ok but the connection is closed.")
     p.add_argument("--version", action="version", version="automud %s" % __version__)
     p.add_argument("-s", "--session", default="default", metavar="NAME",
@@ -1239,9 +1302,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print the full structured response as one JSON object")
 
     c = sub.add_parser("connect", help="open a session (starts the background daemon)")
-    c.add_argument("host", nargs="?", help="telnet host")
+    c.add_argument("host", nargs="?", help="telnet host, or a site name from 'sites'")
     c.add_argument("port", nargs="?", type=int, help="telnet port")
-    c.add_argument("--demo", choices=sorted(DEMOS), help="use a built-in demo target")
+    c.add_argument("--demo", metavar="NAME",
+                   help="connect to a named site from the directory (see 'sites')")
     c.add_argument("--tls", action="store_true", help="wrap the connection in TLS")
     c.add_argument("--tls-insecure", action="store_true",
                    help="TLS without certificate verification (self-signed MUDs)")
@@ -1300,6 +1364,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("kill", help="force-stop a wedged daemon and clear the session")
 
+    si = sub.add_parser("sites", help="list verified public telnet/MUD targets")
+    add_json(si)
+
     lg = sub.add_parser("log", help="print the session output log")
     lg.add_argument("--tail", type=int, default=0, help="only the last N lines (0 = all)")
     return p
@@ -1340,12 +1407,18 @@ def main() -> None:
     _set_state_dir(os.path.join(STATE_BASE, args.session))
 
     if args.cmd == "connect":
-        if args.demo:
-            host, port = DEMOS[args.demo]
+        name = (args.demo or "").lower() or \
+               (args.host.lower() if args.host and not args.port else "")
+        if name and name in SITES:
+            host, port = SITES[name][0], SITES[name][1]
+        elif name:
+            print("unknown site '%s'; run 'automud sites' for the directory" % name)
+            sys.exit(2)
         elif args.host and args.port:
             host, port = args.host, args.port
         else:
-            print("usage: connect HOST PORT   |   connect --demo NAME")
+            print("usage: connect HOST PORT   |   connect NAME   "
+                  "(run 'automud sites' for names)")
             sys.exit(2)
         sys.exit(cmd_connect(host, port, quiet=args.quiet, maxw=args.max, tls=args.tls,
                              tls_insecure=args.tls_insecure, encoding=args.encoding,
@@ -1375,6 +1448,8 @@ def main() -> None:
         sys.exit(cmd_close(json_mode=args.json))
     elif args.cmd == "kill":
         sys.exit(cmd_kill())
+    elif args.cmd == "sites":
+        sys.exit(cmd_sites(json_mode=args.json))
     elif args.cmd == "log":
         sys.exit(cmd_log(tail=args.tail))
 

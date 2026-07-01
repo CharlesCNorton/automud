@@ -23,7 +23,8 @@ Standard library only, Python 3.8+.
 ## Use
 
 ```
-automud connect --demo achaea       # or: automud connect <host> <port>
+automud sites                        # list verified public targets
+automud connect achaea               # by name, or: automud connect <host> <port>
 automud send 2                       # send a line, print the reply
 automud send Maelvorn
 automud recv                          # drain any new output
@@ -45,8 +46,10 @@ automud close
 | `log [--tail N]` | session transcript (last N lines with `--tail`) |
 | `close` | end the session and stop the daemon |
 | `kill` | force-stop a wedged daemon and clear the session |
+| `sites` | directory of ~45 verified public targets (MUDs, MOOs, BBSes, services) |
 
-Built-in demo targets: `achaea`, `zork` (telehack.com), `chess` (freechess.org).
+Every entry in `sites` was verified reachable by a live probe. Connect to any of them by
+name: `automud connect aardwolf`, `automud connect telehack`, `automud connect fics`.
 
 Every reading verb takes `--json` and prints one structured object (`data`, `prompt`,
 `connected`, `elapsed`, ...) instead of raw text, which is the natural mode for driving it
