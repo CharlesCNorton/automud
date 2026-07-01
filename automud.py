@@ -11,6 +11,7 @@ to it with discrete verbs:
     automud send 2                     # send a line, print the reply
     automud send Maelvorn
     automud recv                        # drain any new output
+    automud wait --for "You have died"  # block until the output matches a regex
     automud state                       # structured game state (GMCP) as JSON
     automud status
     automud close
@@ -22,14 +23,28 @@ What the daemon does for you:
   * Prompt aware: it treats the telnet GA/EOR marker most MUDs send after a prompt as the
     "your turn" signal, and refuses Suppress-Go-Ahead so that marker keeps flowing.
   * GMCP capture: it negotiates GMCP and parses the structured state modern MUDs push
-    (Char.Vitals, Room.Info, etc.) into JSON you can read with `state`. It refuses every
-    other option it doesn't understand (compression, MSDP, MXP) rather than choking on it.
+    (Char.Vitals, Room.Info, etc.) into JSON you can read with `state`. Standard list
+    deltas (Room.AddPlayer, Char.Afflictions.Add, ...) are applied to their lists, and
+    Comm.Channel.Text is kept as a bounded history. Options it does not implement
+    (compression, MSDP, MXP) are refused rather than mishandled; TTYPE, NAWS and CHARSET
+    are answered.
+  * Encodings: --encoding sets the wire charset (default utf-8); telnet CHARSET
+    negotiation can switch it when the server asks.
+  * TLS: --tls wraps the connection (--tls-insecure skips certificate checks for MUDs
+    with self-signed certs).
 
 The control channel is a localhost-only socket gated by a per-session token kept in a
-private (0700) state directory, so only processes running as you can drive the session.
+private (0700) per-user state directory, so only processes running as you can drive the
+session. The daemon pid is tracked: stale sessions are detected and cleared, and `kill`
+force-stops a wedged daemon.
+
+Exit codes: 0 success; 1 failure; 2 usage error; 3 the operation succeeded but the MUD
+connection is closed.
 
 Config (optional):
-    AUTOMUD_DIR : session/state directory (default: <tempdir>/automud)
+    AUTOMUD_DIR : state directory base (default: $XDG_RUNTIME_DIR/automud, else
+                  <tempdir>/automud-<uid> on POSIX, <tempdir>/automud on Windows).
+                  Each --session NAME lives in its own subdirectory.
 """
 
 import argparse
@@ -39,17 +54,51 @@ import json
 import os
 import re
 import secrets
+import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-AUTOMUD_DIR = os.environ.get("AUTOMUD_DIR") or os.path.join(tempfile.gettempdir(), "automud")
-SESSION_JSON = os.path.join(AUTOMUD_DIR, "session.json")
-OUT_LOG = os.path.join(AUTOMUD_DIR, "out.log")
-DAEMON_LOG = os.path.join(AUTOMUD_DIR, "daemon.log")
+__version__ = "0.2.0"
+
+
+# ------------------------------ state directory ------------------------------
+
+def _default_base() -> str:
+    if os.name != "nt":
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg:
+            return os.path.join(xdg, "automud")
+        return os.path.join(tempfile.gettempdir(), "automud-%d" % os.getuid())
+    return os.path.join(tempfile.gettempdir(), "automud")
+
+
+STATE_BASE = os.environ.get("AUTOMUD_DIR") or _default_base()
+
+# Set by _set_state_dir(); one directory per session name.
+STATE_DIR = ""
+SESSION_JSON = ""
+OUT_LOG = ""
+OUT_PREV_LOG = ""
+DAEMON_LOG = ""
+CONNECT_LOCK = ""
+
+
+def _set_state_dir(d: str) -> None:
+    global STATE_DIR, SESSION_JSON, OUT_LOG, OUT_PREV_LOG, DAEMON_LOG, CONNECT_LOCK
+    STATE_DIR = d
+    SESSION_JSON = os.path.join(d, "session.json")
+    OUT_LOG = os.path.join(d, "out.log")
+    OUT_PREV_LOG = os.path.join(d, "out.prev.log")
+    DAEMON_LOG = os.path.join(d, "daemon.log")
+    CONNECT_LOCK = os.path.join(d, "connect.lock")
+
+
+_set_state_dir(os.path.join(STATE_BASE, "default"))
 
 # Keep at most this many characters of received text in memory (the full stream still goes
 # to OUT_LOG, which `log` reads). Trimming drops the oldest buffered text once the buffer
@@ -57,6 +106,13 @@ DAEMON_LOG = os.path.join(AUTOMUD_DIR, "daemon.log")
 # also drops not-yet-read bytes from the in-memory buffer (they survive in OUT_LOG). The
 # read cursor is advanced past anything dropped so nothing is ever re-served.
 BUFFER_CAP = 1_000_000
+
+# Bound on the Comm.Channel.Text history kept under the synthetic Comm.Channel.History key.
+COMM_HISTORY_CAP = 200
+
+# A trailing incomplete escape sequence is held back until the next chunk completes it,
+# but never more than this many characters (so a never-terminated OSC can't pin output).
+PENDING_CAP = 4096
 
 DEMOS = {
     "zork": ("telehack.com", 23),
@@ -68,37 +124,126 @@ DEMOS = {
 IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
 GA, EOR_CMD = 249, 239
 # Telnet options
-OPT_GMCP, OPT_EOR = 201, 25
-# Options we ask the server to enable. GMCP gives structured state; EOR gives prompt markers.
-# We deliberately do NOT request SGA (option 3): suppressing Go-Ahead would kill the other
-# prompt marker. Everything not listed here is refused, which also keeps us from accidentally
-# enabling compression (MCCP) and turning the stream into zlib garbage.
-WANT_DO = {OPT_GMCP, OPT_EOR}
+OPT_TTYPE, OPT_EOR, OPT_NAWS, OPT_CHARSET, OPT_GMCP = 24, 25, 31, 42, 201
+# Options we ask the server to enable. GMCP gives structured state; EOR gives prompt
+# markers; CHARSET lets the server pick a wire encoding. We deliberately do NOT request
+# SGA (option 3): suppressing Go-Ahead would kill the other prompt marker. Everything not
+# listed here is refused, which also keeps us from accidentally enabling compression
+# (MCCP) and turning the stream into zlib garbage.
+WANT_DO = {OPT_GMCP, OPT_EOR, OPT_CHARSET}
+# Options we agree to enable on our side when the server asks (some servers gate features
+# or hold menus until terminal negotiation answers).
+WILL_US = {OPT_TTYPE, OPT_NAWS}
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][AB012]|[\x00-\x08\x0b\x0c\x0e-\x1f]")
-# A trailing, still-incomplete escape sequence (no final byte yet). Held back so a sequence
-# split across two TCP reads is completed before it is emitted or stripped.
-_ANSI_INCOMPLETE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*|[()])?$")
+CHARSET_REQUEST, CHARSET_ACCEPTED, CHARSET_REJECTED = 1, 2, 3
+TTYPE_IS, TTYPE_SEND = 0, 1
+TTYPE_CYCLE = ("AUTOMUD", "ANSI", "MTTS 1")
+NAWS_COLS, NAWS_ROWS = 120, 40
+
+_OPT_NAMES = {1: "ECHO", 3: "SGA", 24: "TTYPE", 25: "EOR", 31: "NAWS", 42: "CHARSET",
+              69: "MSDP", 70: "MSSP", 85: "MCCP1", 86: "MCCP2", 90: "MSP", 91: "MXP",
+              200: "ATCP", 201: "GMCP"}
+
+
+def _optname(opt: int) -> str:
+    return _OPT_NAMES.get(opt, str(opt))
+
+
+# CSI, OSC (BEL- or ST-terminated), DCS/SOS/PM/APC (ST-terminated), charset shifts,
+# other single-char escapes, and stray control characters (not \t \n \r).
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b[PX^_][^\x1b]*\x1b\\"
+    r"|\x1b[()][AB012]"
+    r"|\x1b[=>78@-Z\\-_]"
+    r"|[\x00-\x08\x0b\x0c\x0e-\x1f]"
+)
+# A trailing, still-incomplete escape sequence (no final byte / terminator yet). Held back
+# so a sequence split across two TCP reads is completed before it is emitted or stripped.
+_ANSI_INCOMPLETE = re.compile(
+    r"\x1b(?:\[[0-9;?]*[ -/]*|\][^\x07\x1b]*\x1b?|[PX^_][^\x1b]*\x1b?|[()])?$"
+)
 
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
+# ------------------------------ process helpers ------------------------------
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists. Never signals the process."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill(pid, 0) on Windows TERMINATES the process, so query via the API.
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return True     # can't tell; assume alive rather than clearing a live session
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _kill_pid(pid: int) -> None:
+    """Terminate a daemon: SIGTERM, then SIGKILL if it lingers (POSIX)."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    for _ in range(20):
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
+    if os.name != "nt":
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 # ------------------------------ session state files ------------------------------
 
 def _ensure_dir() -> None:
-    os.makedirs(AUTOMUD_DIR, exist_ok=True)
-    try:
-        os.chmod(AUTOMUD_DIR, 0o700)          # POSIX: keep the state dir private (no-op on Windows)
-    except Exception:
-        pass
+    """Create the state directory, private to this user. On POSIX, refuse to use a
+    directory owned by someone else (a predictable path in /tmp can be pre-created by
+    another local user, who could then swap session.json under us)."""
+    for d in (os.path.dirname(STATE_DIR), STATE_DIR):
+        os.makedirs(d, exist_ok=True)
+        if os.name != "nt":
+            st = os.stat(d)
+            if st.st_uid != os.geteuid():
+                raise RuntimeError(
+                    "state dir %s is owned by uid %d, not you (uid %d); "
+                    "point AUTOMUD_DIR somewhere private" % (d, st.st_uid, os.geteuid()))
+            os.chmod(d, 0o700)
 
 
 def _harden(path: str, mode: int) -> None:
     try:
-        os.chmod(path, mode)
-    except Exception:
+        os.chmod(path, mode)        # no-op on Windows; %TEMP% is already per-user there
+    except OSError:
         pass
 
 
@@ -107,8 +252,8 @@ def _write_session(data: dict) -> None:
     tmp = SESSION_JSON + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
+    _harden(tmp, 0o600)
     os.replace(tmp, SESSION_JSON)
-    _harden(SESSION_JSON, 0o600)
 
 
 def _read_session() -> Optional[dict]:
@@ -119,33 +264,123 @@ def _read_session() -> Optional[dict]:
         return None
 
 
+def _acquire_connect_lock() -> None:
+    """One connect at a time per session dir, so racing connects can't strand a daemon
+    whose control port was never recorded. Stale locks (dead pid) are reclaimed."""
+    for _ in range(2):
+        try:
+            fd = os.open(CONNECT_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            return
+        except FileExistsError:
+            try:
+                with open(CONNECT_LOCK, "r", encoding="ascii") as f:
+                    pid = int(f.read().strip() or "0")
+            except Exception:
+                pid = 0
+            if pid and _pid_alive(pid):
+                raise RuntimeError("another connect is in progress (pid %d)" % pid)
+            try:
+                os.remove(CONNECT_LOCK)
+            except OSError:
+                pass
+    raise RuntimeError("could not acquire connect lock")
+
+
+def _release_connect_lock() -> None:
+    try:
+        os.remove(CONNECT_LOCK)
+    except OSError:
+        pass
+
+
+# ------------------------------ GMCP state ------------------------------
+
+# Standard list-delta packages: applied to their canonical list so `state` reflects
+# current membership instead of the last event.
+_GMCP_LIST_DELTAS = {
+    "Char.Afflictions.Add": ("Char.Afflictions.List", True),
+    "Char.Afflictions.Remove": ("Char.Afflictions.List", False),
+    "Char.Defences.Add": ("Char.Defences.List", True),
+    "Char.Defences.Remove": ("Char.Defences.List", False),
+    "Room.AddPlayer": ("Room.Players", True),
+    "Room.RemovePlayer": ("Room.Players", False),
+}
+
+
+def _entry_name(e: Any) -> Any:
+    return e.get("name") if isinstance(e, dict) else e
+
+
+def _apply_gmcp(state: dict, package: str, value: Any) -> None:
+    now = time.monotonic()
+    gmcp = state["gmcp"]
+    gmcp[package] = value
+    state["gmcp_n"] += 1
+    state["gmcp_seq"][package] = state["gmcp_n"]
+    state["gmcp_time"][package] = now
+    if package == "Comm.Channel.Text":
+        hist = gmcp.setdefault("Comm.Channel.History", [])
+        hist.append(value)
+        del hist[:-COMM_HISTORY_CAP]
+        state["gmcp_seq"]["Comm.Channel.History"] = state["gmcp_n"]
+        state["gmcp_time"]["Comm.Channel.History"] = now
+        return
+    delta = _GMCP_LIST_DELTAS.get(package)
+    if delta:
+        target_key, is_add = delta
+        target = gmcp.get(target_key)
+        if not isinstance(target, list):
+            target = gmcp[target_key] = []
+        if is_add:
+            target.append(value)
+        else:
+            removed = value if isinstance(value, list) else [value]
+            names = {_entry_name(n) for n in removed}
+            gmcp[target_key] = [e for e in target if _entry_name(e) not in names]
+        state["gmcp_seq"][target_key] = state["gmcp_n"]
+        state["gmcp_time"][target_key] = now
+
+
 # ------------------------------ telnet / GMCP parser ------------------------------
 
 class MudConn:
     """Minimal telnet client: separates plain text from IAC control, answers option
     negotiation (only on state change, so it can't loop), captures GMCP subnegotiation as
-    JSON, and flags GA/EOR prompt markers.
+    JSON, answers TTYPE/NAWS/CHARSET, and flags GA/EOR prompt markers.
 
-    Receipt accounting uses monotonic counters, not buffer indices, so trimming the in-memory
-    buffer never disturbs the read cursor or the wait logic:
+    Receipt accounting uses monotonic counters, not buffer indices, so trimming the
+    in-memory buffer never disturbs the read cursor or the wait logic:
       total : chars ever received
       read  : chars handed to the client
       base  : chars dropped off the front of `buffer` (buffer == stream[base:total])
     """
 
-    def __init__(self, writer: asyncio.StreamWriter, state: dict, log_fh):
+    def __init__(self, writer: asyncio.StreamWriter, state: dict, log_fh,
+                 encoding: str = "utf-8", debug: bool = False):
         self.w = writer
         self.s = state
         self.log = log_fh
+        self.debug = debug
+        try:
+            self.enc = codecs.lookup(encoding).name
+        except LookupError:
+            self.enc = "utf-8"
         self.mode = "text"          # text | iac | neg | sb | sbiac
-        self.cmd = None
-        self.sb_opt = None
+        self.cmd: Optional[int] = None
+        self.sb_opt: Optional[int] = None
         self.sb = bytearray()
         self.text = bytearray()
-        self.him = {}               # server-side option enabled? (None unknown)
-        self.us = {}                # our-side option enabled?
-        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.him: Dict[int, Optional[bool]] = {}    # server-side option enabled?
+        self.us: Dict[int, Optional[bool]] = {}     # our-side option enabled?
+        self._ttype_idx = 0
+        self._decoder = codecs.getincrementaldecoder(self.enc)("replace")
         self._pending = ""          # decoded text held back across reads (partial escape)
+
+    def _dbg(self, msg: str) -> None:
+        if self.debug:
+            print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
 
     # ---- byte stream ----
     def feed(self, data: bytes) -> None:
@@ -231,9 +466,10 @@ class MudConn:
         self.text = bytearray()
         emit = self._pending
         # Hold back a trailing incomplete escape so a sequence split across reads isn't
-        # emitted or mis-stripped; it completes on the next chunk.
+        # emitted or mis-stripped; it completes on the next chunk. Capped so a
+        # never-terminated sequence can't pin the stream.
         m = _ANSI_INCOMPLETE.search(emit)
-        if m:
+        if m and len(emit) - m.start() <= PENDING_CAP:
             self._pending = emit[m.start():]
             emit = emit[:m.start()]
         else:
@@ -253,9 +489,18 @@ class MudConn:
         except Exception:
             pass
 
+    def _raw_sb(self, opt: int, payload: bytes) -> None:
+        try:
+            self.w.write(bytes([IAC, SB, opt])
+                         + payload.replace(b"\xff", b"\xff\xff") + bytes([IAC, SE]))
+        except Exception:
+            pass
+
     def _negotiate(self, cmd: int, opt: int) -> None:
         # Respond only when the option's state actually changes, per the telnet Q-method,
         # so a server that re-announces options can't make us loop.
+        self._dbg("neg: %s %s" % ({DO: "DO", DONT: "DONT", WILL: "WILL", WONT: "WONT"}.get(cmd, cmd),
+                                  _optname(opt)))
         if cmd == WILL:
             want = opt in WANT_DO
             if want and not self.him.get(opt):
@@ -271,7 +516,12 @@ class MudConn:
                 self.him[opt] = False
                 self._raw(IAC, DONT, opt)
         elif cmd == DO:
-            if self.us.get(opt) is not False:           # we enable nothing on our side
+            if opt in WILL_US:
+                if not self.us.get(opt):
+                    self.us[opt] = True
+                    self._raw(IAC, WILL, opt)
+                    self._us_enabled(opt)
+            elif self.us.get(opt) is not False:
                 self.us[opt] = False
                 self._raw(IAC, WONT, opt)
         elif cmd == DONT:
@@ -279,36 +529,93 @@ class MudConn:
                 self.us[opt] = False
                 self._raw(IAC, WONT, opt)
 
+    def _us_enabled(self, opt: int) -> None:
+        if opt == OPT_NAWS:
+            self._raw_sb(OPT_NAWS, bytes([NAWS_COLS >> 8, NAWS_COLS & 0xFF,
+                                          NAWS_ROWS >> 8, NAWS_ROWS & 0xFF]))
+        elif opt == OPT_TTYPE:
+            self._ttype_idx = 0
+
     def _send_gmcp(self, package: str, payload: str) -> None:
-        msg = (package + " " + payload).encode("utf-8")
-        try:
-            self.w.write(bytes([IAC, SB, OPT_GMCP]) + msg + bytes([IAC, SE]))
-        except Exception:
-            pass
+        msg = (package + " " + payload).encode("utf-8") if payload else package.encode("utf-8")
+        self._raw_sb(OPT_GMCP, msg)
 
     def _gmcp_hello(self) -> None:
-        self._send_gmcp("Core.Hello", '{"client":"AutoMUD","version":"1.0"}')
+        self._send_gmcp("Core.Hello",
+                        json.dumps({"client": "AutoMUD", "version": __version__}))
         self._send_gmcp("Core.Supports.Set",
                         '["Char 1","Char.Vitals 1","Char.Status 1","Char.Skills 1",'
-                        '"Room 1","Comm.Channel 1"]')
+                        '"Char.Afflictions 1","Char.Defences 1","Room 1","Comm.Channel 1"]')
 
     def _subneg(self, opt: int, payload: bytes) -> None:
-        if opt != OPT_GMCP:
-            return                                      # MSDP/MXP/etc.: ignore, don't choke
+        if opt == OPT_GMCP:
+            self._gmcp_in(payload)
+        elif opt == OPT_TTYPE:
+            if payload[:1] == bytes([TTYPE_SEND]):
+                name = TTYPE_CYCLE[min(self._ttype_idx, len(TTYPE_CYCLE) - 1)]
+                self._ttype_idx += 1
+                self._dbg("ttype: sending %r" % name)
+                self._raw_sb(OPT_TTYPE, bytes([TTYPE_IS]) + name.encode("ascii"))
+        elif opt == OPT_CHARSET:
+            self._charset(payload)
+        # MSDP/MXP/etc.: ignore, don't choke
+
+    def _gmcp_in(self, payload: bytes) -> None:
         text = payload.decode("utf-8", "replace")
         sp = text.find(" ")
         if sp == -1:
             package, body = text.strip(), ""
         else:
             package, body = text[:sp].strip(), text[sp + 1:]
-        value = None
+        value: Any = None
         if body.strip():
             try:
                 value = json.loads(body)
             except Exception:
                 value = body
         if package:
-            self.s["gmcp"][package] = value
+            self._dbg("gmcp: %s" % package)
+            _apply_gmcp(self.s, package, value)
+
+    def _charset(self, payload: bytes) -> None:
+        if payload[:1] != bytes([CHARSET_REQUEST]):
+            return
+        body = payload[1:]
+        if body.startswith(b"[TTABLE]"):
+            body = body[len(b"[TTABLE]") + 1:]           # skip literal + version byte
+        if not body:
+            self._raw_sb(OPT_CHARSET, bytes([CHARSET_REJECTED]))
+            return
+        sep, names = body[0:1], [n for n in body[1:].split(body[0:1]) if n]
+        offered: List[Tuple[bytes, str]] = []
+        for n in names:
+            try:
+                offered.append((n, codecs.lookup(n.decode("ascii", "replace").strip()).name))
+            except Exception:
+                continue
+        chosen = None
+        for n, cname in offered:                          # prefer what we're already using
+            if cname == self.enc:
+                chosen = (n, cname)
+                break
+        if chosen is None:
+            for n, cname in offered:                      # then utf-8
+                if cname == "utf-8":
+                    chosen = (n, cname)
+                    break
+        if chosen is None and offered:
+            chosen = offered[0]
+        if chosen is None:
+            self._dbg("charset: rejected %r" % names)
+            self._raw_sb(OPT_CHARSET, bytes([CHARSET_REJECTED]))
+            return
+        raw_name, cname = chosen
+        self._dbg("charset: accepted %s" % cname)
+        self._raw_sb(OPT_CHARSET, bytes([CHARSET_ACCEPTED]) + raw_name)
+        if cname != self.enc:
+            self._pending += self._decoder.decode(b"", final=True)
+            self._decoder = codecs.getincrementaldecoder(cname)("replace")
+            self.enc = cname
 
 
 # ------------------------------ daemon ------------------------------
@@ -341,49 +648,164 @@ def _drain(state: dict) -> str:
     return data
 
 
+def _unread(state: dict) -> str:
+    return state["buffer"][state["read"] - state["base"]:]
+
+
 def _vitals(state: dict) -> dict:
     v = state["gmcp"].get("Char.Vitals")
     return v if isinstance(v, dict) else {}
 
 
-async def _do_op(req: dict, state: dict, writer: asyncio.StreamWriter) -> dict:
+def _outbound(text: str, enc: str) -> bytes:
+    """Normalize newlines to CRLF, encode for the wire, escape IAC, terminate the line."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    body = "\r\n".join(text.split("\n"))
+    return body.encode(enc, "replace").replace(b"\xff", b"\xff\xff") + b"\r\n"
+
+
+async def _do_op(req: dict, state: dict, conn: MudConn) -> dict:
     op = req.get("op")
     quiet = float(req.get("quiet", 0.3))
     maxw = float(req.get("max", 5.0))
+    start = time.monotonic()
+
+    def took() -> float:
+        return round(time.monotonic() - start, 3)
+
     if op == "send":
         async with state["lock"]:
             since = state["total"]
             state["prompt_seen"] = False
             try:
-                writer.write((req.get("data") or "").encode("utf-8").replace(b"\xff", b"\xff\xff") + b"\r\n")
-                await writer.drain()
+                conn.w.write(_outbound(req.get("data"), conn.enc))
+                await asyncio.wait_for(conn.w.drain(), timeout=10.0)
+            except asyncio.TimeoutError:
+                return {"ok": False, "error": "send stalled (socket buffer full for 10s)"}
             except Exception as e:
-                return {"ok": False, "error": f"send failed: {e}"}
+                return {"ok": False, "error": "send failed: %s" % e}
             await _wait_settled(state, since, quiet, maxw)
-            return {"ok": True, "data": _drain(state), "connected": state["connected"]}
+            prompt = state["prompt_seen"]
+            return {"ok": True, "data": _drain(state), "prompt": prompt,
+                    "connected": state["connected"], "elapsed": took()}
+
     if op == "recv":
         async with state["lock"]:
             if req.get("block", True):
                 await _wait_settled(state, state["read"], quiet, maxw)
-            return {"ok": True, "data": _drain(state), "connected": state["connected"]}
+            prompt = state["prompt_seen"]
+            return {"ok": True, "data": _drain(state), "prompt": prompt,
+                    "connected": state["connected"], "elapsed": took()}
+
+    if op == "wait":
+        pattern, pkg = req.get("pattern"), req.get("gmcp")
+        rx = None
+        if pattern:
+            try:
+                rx = re.compile(pattern)
+            except re.error as e:
+                return {"ok": False, "error": "bad regex: %s" % e}
+        if rx is None and not pkg:
+            return {"ok": False, "error": "wait needs a pattern and/or a gmcp package"}
+        seq0 = state["gmcp_seq"].get(pkg, 0) if pkg else 0
+        while True:
+            hit = (rx is not None and rx.search(_unread(state)) is not None) or \
+                  (bool(pkg) and state["gmcp_seq"].get(pkg, 0) > seq0)
+            if hit:
+                async with state["lock"]:
+                    prompt = state["prompt_seen"]
+                    data = _drain(state)
+                resp = {"ok": True, "matched": True, "data": data, "prompt": prompt,
+                        "connected": state["connected"], "elapsed": took()}
+                if pkg:
+                    resp["gmcp"] = state["gmcp"].get(pkg)
+                return resp
+            if not state["connected"] or time.monotonic() - start >= maxw:
+                # No match: leave the unread text for recv.
+                return {"ok": True, "matched": False, "data": "",
+                        "connected": state["connected"], "elapsed": took()}
+            await asyncio.sleep(0.05)
+
+    if op == "gmcp":
+        pkg = (req.get("package") or "").strip()
+        if not pkg:
+            return {"ok": False, "error": "missing GMCP package"}
+        try:
+            conn._send_gmcp(pkg, req.get("data") or "")
+            await asyncio.wait_for(conn.w.drain(), timeout=10.0)
+        except Exception as e:
+            return {"ok": False, "error": "gmcp send failed: %s" % e}
+        return {"ok": True, "elapsed": took()}
+
     if op == "state":
-        return {"ok": True, "gmcp": state["gmcp"], "connected": state["connected"]}
+        now = time.monotonic()
+        ages = {k: round(now - t, 1) for k, t in state["gmcp_time"].items()}
+        return {"ok": True, "gmcp": state["gmcp"], "ages": ages,
+                "connected": state["connected"]}
+
     if op == "status":
+        server_opts = sorted(_optname(o) for o, v in conn.him.items() if v)
+        client_opts = sorted(_optname(o) for o, v in conn.us.items() if v)
         return {"ok": True, "connected": state["connected"],
                 "unread": state["total"] - state["read"], "total_chars": state["total"],
-                "gmcp_packages": sorted(state["gmcp"].keys()), "vitals": _vitals(state)}
+                "gmcp_packages": sorted(state["gmcp"].keys()), "vitals": _vitals(state),
+                "last_rx_age": round(time.monotonic() - state["last_rx"], 1),
+                "uptime": round(time.time() - state["started_wall"], 1),
+                "encoding": conn.enc, "prompt_seen": state["prompt_seen"],
+                "options": {"server": server_opts, "client": client_opts}}
+
     if op == "close":
         return {"ok": True}                  # the control handler stops the daemon after this acks
-    return {"ok": False, "error": f"unknown op '{op}'"}
+    return {"ok": False, "error": "unknown op '%s'" % op}
 
 
-async def _daemon_main(host: str, port: int) -> None:
-    _ensure_dir()
+def _keepalive(writer: asyncio.StreamWriter) -> None:
+    """Enable TCP keepalive so a NAT-dropped link is eventually detected instead of
+    looking connected forever."""
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=20.0)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # TransportSocket has no ioctl, so tune via setsockopt where the platform
+        # exposes the options (Linux, macOS, Windows 10+); bare SO_KEEPALIVE otherwise.
+        for opt, val in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 20), ("TCP_KEEPCNT", 4)):
+            if hasattr(socket, opt):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def _dlog(msg: str) -> None:
+    print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+async def _daemon_main(host: str, port: int, tls: bool = False, tls_insecure: bool = False,
+                       encoding: str = "utf-8", idle_exit: float = 0.0,
+                       debug: bool = False) -> None:
+    try:
+        _ensure_dir()
+    except Exception as e:
+        _dlog("state dir unusable: %s" % e)
+        return
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        if tls_insecure:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=20.0)
     except Exception as e:
         _write_session({"error": str(e), "host": host, "port": port})
+        _dlog("connect failed: %s" % e)
         return
+    _keepalive(writer)
+    _dlog("connected to %s:%d (tls=%s encoding=%s)" % (host, port, tls, encoding))
 
     try:
         log_fh = open(OUT_LOG, "a", encoding="utf-8")
@@ -392,21 +814,33 @@ async def _daemon_main(host: str, port: int) -> None:
         log_fh = None
 
     state = {"buffer": "", "total": 0, "read": 0, "base": 0, "connected": True, "gmcp": {},
-             "last_rx": time.monotonic(), "prompt_seen": False, "lock": asyncio.Lock()}
-    conn = MudConn(writer, state, log_fh)
+             "gmcp_seq": {}, "gmcp_time": {}, "gmcp_n": 0,
+             "last_rx": time.monotonic(), "prompt_seen": False, "lock": asyncio.Lock(),
+             "started_wall": time.time(), "last_ctl": time.monotonic()}
+    conn = MudConn(writer, state, log_fh, encoding=encoding, debug=debug)
     stop = asyncio.Event()
     token = secrets.token_hex(16)            # per-session secret; only our own processes know it
+
+    loop = asyncio.get_running_loop()
+    for sig in ("SIGTERM", "SIGINT"):        # graceful teardown on kill (POSIX only)
+        try:
+            loop.add_signal_handler(getattr(signal, sig), stop.set)
+        except (NotImplementedError, RuntimeError, AttributeError, ValueError):
+            pass
 
     async def control(creader: asyncio.StreamReader, cwriter: asyncio.StreamWriter) -> None:
         op = None
         authed = False
+        state["last_ctl"] = time.monotonic()
         try:
             line = await creader.readline()
+            if not line.strip():                        # blank line: ignore, just close
+                return
             req = json.loads(line.decode("utf-8", "replace").strip() or "{}")
             if secrets.compare_digest(str(req.get("token")), token):
                 authed = True
                 op = req.get("op")
-                resp = await _do_op(req, state, writer)
+                resp = await _do_op(req, state, conn)
             else:
                 resp = {"ok": False, "error": "auth failed"}
             cwriter.write((json.dumps(resp) + "\n").encode("utf-8"))
@@ -423,12 +857,15 @@ async def _daemon_main(host: str, port: int) -> None:
             except Exception:
                 pass
             if authed and op == "close":      # stop only after an authenticated close acks
+                _dlog("close requested")
                 stop.set()
 
-    server = await asyncio.start_server(control, "127.0.0.1", 0)
+    server = await asyncio.start_server(control, "127.0.0.1", 0, limit=1 << 20)
     ctrl_port = server.sockets[0].getsockname()[1]
     _write_session({"host": host, "port": port, "control_port": ctrl_port,
-                    "pid": os.getpid(), "token": token})
+                    "pid": os.getpid(), "token": token, "tls": tls,
+                    "encoding": encoding, "started": state["started_wall"],
+                    "version": __version__})
 
     async def pump() -> None:
         try:
@@ -441,15 +878,27 @@ async def _daemon_main(host: str, port: int) -> None:
                     break
                 conn.feed(data)
         finally:
+            if state["connected"]:
+                _dlog("MUD connection closed")
             state["connected"] = False
 
-    pump_task = asyncio.create_task(pump())
-    serve_task = asyncio.create_task(server.serve_forever())
+    async def watchdog() -> None:
+        while not stop.is_set():
+            await asyncio.sleep(5.0)
+            if idle_exit > 0 and time.monotonic() - state["last_ctl"] > idle_exit:
+                _dlog("idle-exit: no control ops for %.0fs" % idle_exit)
+                stop.set()
+                return
+
+    tasks = [asyncio.create_task(pump()), asyncio.create_task(server.serve_forever()),
+             asyncio.create_task(watchdog())]
     await stop.wait()
     state["connected"] = False
-    for t in (pump_task, serve_task):
+    _dlog("terminating")
+    for t in tasks:
         t.cancel()
-    for closer in (lambda: writer.close(), lambda: log_fh and log_fh.close(),
+    for closer in (server.close, writer.close,
+                   lambda: log_fh and log_fh.close(),
                    lambda: os.remove(SESSION_JSON)):
         try:
             closer()
@@ -459,10 +908,17 @@ async def _daemon_main(host: str, port: int) -> None:
 
 # ------------------------------ client (the verbs) ------------------------------
 
-def _control(op: str, _timeout: float = 35.0, **kw) -> dict:
+def _control(op: str, _timeout: float = 35.0, **kw: Any) -> dict:
     sess = _read_session()
     if not sess or "control_port" not in sess:
         return {"ok": False, "error": "no active session (run 'connect' first)"}
+    pid = sess.get("pid")
+    if pid and not _pid_alive(pid):
+        try:
+            os.remove(SESSION_JSON)                     # stale: daemon died without cleanup
+        except OSError:
+            pass
+        return {"ok": False, "error": "daemon is gone (stale session cleared; run 'connect')"}
     try:
         with socket.create_connection(("127.0.0.1", sess["control_port"]), timeout=_timeout) as s:
             s.settimeout(_timeout)
@@ -479,15 +935,33 @@ def _control(op: str, _timeout: float = 35.0, **kw) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def _spawn_daemon(host: str, port: int) -> None:
+def _spawn_daemon(host: str, port: int, tls: bool, tls_insecure: bool,
+                  encoding: str, idle_exit: float, debug: bool) -> None:
     _ensure_dir()
     try:
         os.remove(SESSION_JSON)
-    except Exception:
+    except OSError:
+        pass
+    # Rotate the previous transcript instead of destroying it.
+    try:
+        if os.path.exists(OUT_LOG) and os.path.getsize(OUT_LOG) > 0:
+            os.replace(OUT_LOG, OUT_PREV_LOG)
+            _harden(OUT_PREV_LOG, 0o600)
+    except OSError:
         pass
     open(OUT_LOG, "w", encoding="utf-8").close()
     _harden(OUT_LOG, 0o600)
-    args = [sys.executable, os.path.abspath(__file__), "--daemon", host, str(port)]
+    args = [sys.executable, os.path.abspath(__file__), "--daemon",
+            "--dir", STATE_DIR, "--host", host, "--port", str(port),
+            "--encoding", encoding]
+    if tls:
+        args.append("--tls")
+    if tls_insecure:
+        args.append("--tls-insecure")
+    if idle_exit:
+        args += ["--idle-exit", str(idle_exit)]
+    if debug:
+        args.append("--debug")
     logf = open(DAEMON_LOG, "w", encoding="utf-8")
     _harden(DAEMON_LOG, 0o600)
     kwargs: dict = {"stdout": logf, "stderr": logf, "stdin": subprocess.DEVNULL}
@@ -511,60 +985,137 @@ def _wait_timeout(maxw: float) -> float:
     return max(35.0, maxw + 15.0)
 
 
-def cmd_connect(host: str, port: int, quiet: float, maxw: float) -> int:
-    old = _read_session()
-    if old and old.get("control_port"):                  # a real live daemon: ask it to exit
-        _control("close")
-        for _ in range(30):                              # and wait for it to clear its session file
-            if not os.path.exists(SESSION_JSON):
+def _finish(r: dict, json_mode: bool, fail_prefix: str) -> int:
+    """Common tail for send/recv: print the payload, surface disconnection (exit 3)."""
+    if not r.get("ok"):
+        if json_mode:
+            print(json.dumps(r))
+        else:
+            print("%s: %s" % (fail_prefix, r.get("error")))
+        return 1
+    if json_mode:
+        print(json.dumps(r))
+    else:
+        _print(r.get("data", ""))
+        if r.get("connected") is False:
+            print("(connection closed by server)", file=sys.stderr)
+    return 0 if r.get("connected", True) else 3
+
+
+def cmd_connect(host: str, port: int, quiet: float, maxw: float, tls: bool,
+                tls_insecure: bool, encoding: str, idle_exit: float, debug: bool,
+                json_mode: bool) -> int:
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        print("unknown encoding '%s'" % encoding)
+        return 2
+    try:
+        _ensure_dir()
+        _acquire_connect_lock()
+    except (RuntimeError, OSError) as e:
+        print("connect failed: %s" % e)
+        return 1
+    try:
+        old = _read_session()
+        if old and old.get("control_port"):
+            pid = old.get("pid")
+            alive = bool(pid) and _pid_alive(pid)
+            if alive:                                    # a real live daemon: ask it to exit
+                _control("close", _timeout=5.0)
+                for _ in range(30):                      # and wait for it to clear its session file
+                    if not os.path.exists(SESSION_JSON):
+                        break
+                    time.sleep(0.1)
+                if os.path.exists(SESSION_JSON) and _pid_alive(pid):
+                    _kill_pid(pid)                       # wedged daemon: force it
+            try:
+                os.remove(SESSION_JSON)
+            except OSError:
+                pass
+        _spawn_daemon(host, port, tls, tls_insecure, encoding, idle_exit, debug)
+        deadline = time.time() + 25
+        sess = None
+        while time.time() < deadline:
+            sess = _read_session()
+            if sess:
                 break
-            time.sleep(0.1)
-    _spawn_daemon(host, port)
-    deadline = time.time() + 25
-    sess = None
-    while time.time() < deadline:
-        sess = _read_session()
-        if sess:
-            break
-        time.sleep(0.3)
+            time.sleep(0.3)
+    finally:
+        _release_connect_lock()
     if not sess:
-        print(f"daemon did not start within 25s; see {DAEMON_LOG}")
+        print("daemon did not start within 25s; see %s" % DAEMON_LOG)
         return 1
     if sess.get("error"):
-        print(f"connect failed: {sess['error']}")
+        print("connect failed: %s" % sess["error"])
         return 1
-    print(f"connected to {host}:{port}")
-    _print(_control("recv", _timeout=_wait_timeout(maxw), block=True, quiet=quiet, max=maxw).get("data", ""))
-    return 0
-
-
-def cmd_send(text: str, quiet: float, maxw: float) -> int:
-    r = _control("send", _timeout=_wait_timeout(maxw), data=text, quiet=quiet, max=maxw)
-    if not r.get("ok"):
-        print(f"send failed: {r.get('error')}")
-        return 1
-    _print(r.get("data", ""))
-    return 0
-
-
-def cmd_recv(quiet: float, maxw: float) -> int:
     r = _control("recv", _timeout=_wait_timeout(maxw), block=True, quiet=quiet, max=maxw)
-    if not r.get("ok"):
-        print(f"recv failed: {r.get('error')}")
-        return 1
+    if json_mode:
+        print(json.dumps({"ok": True, "host": host, "port": port, "tls": tls,
+                          "encoding": encoding, "data": r.get("data", ""),
+                          "connected": r.get("connected", True)}))
+        return 0
+    print("connected to %s:%d%s" % (host, port, " (tls)" if tls else ""))
     _print(r.get("data", ""))
     return 0
 
 
-def cmd_state(key: Optional[str]) -> int:
+def cmd_send(text: str, quiet: float, maxw: float, json_mode: bool) -> int:
+    r = _control("send", _timeout=_wait_timeout(maxw), data=text, quiet=quiet, max=maxw)
+    return _finish(r, json_mode, "send failed")
+
+
+def cmd_recv(quiet: float, maxw: float, block: bool, json_mode: bool) -> int:
+    r = _control("recv", _timeout=_wait_timeout(maxw), block=block, quiet=quiet, max=maxw)
+    return _finish(r, json_mode, "recv failed")
+
+
+def cmd_wait(pattern: Optional[str], gmcp_key: Optional[str], maxw: float,
+             json_mode: bool) -> int:
+    if not pattern and not gmcp_key:
+        print("wait: give --for REGEX and/or --gmcp PACKAGE")
+        return 2
+    r = _control("wait", _timeout=_wait_timeout(maxw), pattern=pattern, gmcp=gmcp_key, max=maxw)
+    if not r.get("ok"):
+        if json_mode:
+            print(json.dumps(r))
+        else:
+            print("wait failed: %s" % r.get("error"))
+        return 1
+    if json_mode:
+        print(json.dumps(r))
+        return 0 if r.get("matched") else 1
+    if r.get("matched"):
+        _print(r.get("data", ""))
+        return 0 if r.get("connected", True) else 3
+    print("wait: no match within %gs" % maxw, file=sys.stderr)
+    return 1
+
+
+def cmd_gmcp(package: str, payload: str, json_mode: bool) -> int:
+    r = _control("gmcp", package=package, data=payload)
+    if json_mode:
+        print(json.dumps(r))
+    else:
+        print("sent" if r.get("ok") else "gmcp failed: %s" % r.get("error"))
+    return 0 if r.get("ok") else 1
+
+
+def cmd_state(key: Optional[str], times: bool, json_mode: bool) -> int:
     r = _control("state")
     if not r.get("ok"):
-        print(f"no session: {r.get('error')}")
+        print(json.dumps(r) if json_mode else "no session: %s" % r.get("error"))
         return 1
+    if json_mode:
+        print(json.dumps(r))
+        return 0
     gmcp = r.get("gmcp", {})
+    if times:
+        print(json.dumps(r.get("ages", {}), indent=2, sort_keys=True))
+        return 0
     if key:
         if key not in gmcp:
-            print(f"no GMCP package '{key}' yet (have: {', '.join(sorted(gmcp)) or 'none'})")
+            print("no GMCP package '%s' yet (have: %s)" % (key, ", ".join(sorted(gmcp)) or "none"))
             return 1
         print(json.dumps(gmcp[key], indent=2))
     elif not gmcp:
@@ -574,35 +1125,90 @@ def cmd_state(key: Optional[str]) -> int:
     return 0
 
 
-def cmd_status() -> int:
+def cmd_status(json_mode: bool) -> int:
     r = _control("status")
     if not r.get("ok"):
-        print(f"no session: {r.get('error')}")
+        print(json.dumps(r) if json_mode else "no session: %s" % r.get("error"))
         return 1
+    sess = _read_session() or {}
+    if json_mode:
+        r["host"], r["port"], r["pid"] = sess.get("host"), sess.get("port"), sess.get("pid")
+        print(json.dumps(r))
+        return 0
     vit = r.get("vitals")
     vit = vit if isinstance(vit, dict) else {}
-    vit_str = f" vitals: hp={vit.get('hp')} mp={vit.get('mp')}" if vit else ""
-    print(f"connected={r['connected']} unread={r['unread']} chars "
-          f"gmcp=[{', '.join(r.get('gmcp_packages', []))}]" + vit_str)
+    vit_str = " vitals: hp=%s mp=%s" % (vit.get("hp"), vit.get("mp")) if vit else ""
+    opts = r.get("options", {})
+    where = "%s:%s pid=%s" % (sess.get("host"), sess.get("port"), sess.get("pid"))
+    print("connected=%s %s uptime=%ss unread=%s last_rx=%ss encoding=%s "
+          "server_opts=[%s] client_opts=[%s] gmcp=[%s]%s"
+          % (r["connected"], where, r.get("uptime"), r["unread"], r.get("last_rx_age"),
+             r.get("encoding"), ", ".join(opts.get("server", [])),
+             ", ".join(opts.get("client", [])), ", ".join(r.get("gmcp_packages", [])),
+             vit_str))
     return 0
 
 
-def cmd_close() -> int:
+def cmd_close(json_mode: bool) -> int:
     r = _control("close")
-    print("closed" if r.get("ok") else f"close failed: {r.get('error')}")
+    if json_mode:
+        print(json.dumps(r))
+    else:
+        print("closed" if r.get("ok") else "close failed: %s" % r.get("error"))
     return 0 if r.get("ok") else 1
 
 
-def cmd_log(tail: int) -> int:
+def cmd_kill() -> int:
+    sess = _read_session()
+    if not sess:
+        print("no session")
+        return 0
+    pid = sess.get("pid")
+    if pid and _pid_alive(pid):
+        _kill_pid(pid)
+        print("killed daemon pid %s" % pid)
+    else:
+        print("daemon already gone")
     try:
-        with open(OUT_LOG, "r", encoding="utf-8") as f:
-            data = f.read()
-    except Exception:
+        os.remove(SESSION_JSON)
+    except OSError:
+        pass
+    return 0
+
+
+def cmd_log(tail: int) -> int:
+    if not os.path.exists(OUT_LOG):
         print("no session log yet")
         return 1
     if tail > 0:
-        data = data[-tail:]
-    _print(data)
+        # Scan backwards in blocks; never load more than needed for N lines.
+        with open(OUT_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            blocks: List[bytes] = []
+            newlines = 0
+            while pos > 0 and newlines <= tail:
+                step = min(65536, pos)
+                pos -= step
+                f.seek(pos)
+                block = f.read(step)
+                blocks.append(block)
+                newlines += block.count(b"\n")
+        data = b"".join(reversed(blocks)).decode("utf-8", "replace")
+        _print("\n".join(data.splitlines()[-tail:]))
+        return 0
+    # Full dump: stream in text mode (universal newlines) instead of loading the
+    # whole transcript into memory.
+    with open(OUT_LOG, "r", encoding="utf-8", errors="replace") as f:
+        last = ""
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            sys.stdout.write(chunk)
+            last = chunk
+        if last and not last.endswith("\n"):
+            sys.stdout.write("\n")
     return 0
 
 
@@ -614,57 +1220,125 @@ def build_parser() -> argparse.ArgumentParser:
         description="Persistent telnet/MUD session driven by discrete verbs, with smart waiting "
                     "and GMCP capture. No LLM, no API key; the operator supplies the intelligence.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Verbs: connect / send / recv / state / status / log / close. Demos: "
-               + ", ".join(sorted(DEMOS)) + ".")
+        epilog="Verbs: connect / send / recv / wait / gmcp / state / status / log / close / kill.\n"
+               "Demos: " + ", ".join(sorted(DEMOS)) + ".\n"
+               "Exit codes: 0 ok; 1 failure; 2 usage; 3 ok but the connection is closed.")
+    p.add_argument("--version", action="version", version="automud %s" % __version__)
+    p.add_argument("-s", "--session", default="default", metavar="NAME",
+                   help="named session (each gets its own state dir; default: 'default')")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def add_wait(sp):
+    def add_wait(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--quiet", type=float, default=0.3,
                         help="seconds of silence that counts as 'server done' (default 0.3)")
         sp.add_argument("--max", type=float, default=5.0,
                         help="hard cap on how long to wait for the reply (default 5)")
 
+    def add_json(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--json", action="store_true",
+                        help="print the full structured response as one JSON object")
+
     c = sub.add_parser("connect", help="open a session (starts the background daemon)")
     c.add_argument("host", nargs="?", help="telnet host")
     c.add_argument("port", nargs="?", type=int, help="telnet port")
     c.add_argument("--demo", choices=sorted(DEMOS), help="use a built-in demo target")
+    c.add_argument("--tls", action="store_true", help="wrap the connection in TLS")
+    c.add_argument("--tls-insecure", action="store_true",
+                   help="TLS without certificate verification (self-signed MUDs)")
+    c.add_argument("--encoding", default="utf-8",
+                   help="wire text encoding (default utf-8; e.g. latin-1, cp437)")
+    c.add_argument("--idle-exit", type=float, default=0.0, metavar="SEC",
+                   help="daemon exits after SEC seconds with no verbs (default: never)")
+    c.add_argument("--debug", action="store_true",
+                   help="log telnet negotiation and GMCP traffic to daemon.log")
     add_wait(c)
+    add_json(c)
 
     s = sub.add_parser("send", help="send one line, then print the reply")
     s.add_argument("text", nargs="*",
                    help="the line to send (joined with spaces); omit to send a blank line, "
-                        "e.g. to answer a [more] pager or a 'press return' prompt")
+                        "e.g. to answer a [more] pager. Use '--' before text starting "
+                        "with '-'. See also --stdin.")
+    s.add_argument("--stdin", action="store_true",
+                   help="read the text from stdin instead of argv (keeps secrets out of "
+                        "the process list and shell history; multi-line input is sent "
+                        "line by line)")
     add_wait(s)
+    add_json(s)
 
     r = sub.add_parser("recv", help="print any new output (waits for it to settle)")
+    r.add_argument("--nowait", action="store_true",
+                   help="return immediately with whatever is buffered")
     add_wait(r)
+    add_json(r)
+
+    w = sub.add_parser("wait", help="block until output matches a regex or GMCP updates")
+    w.add_argument("--for", dest="pattern", metavar="REGEX",
+                   help="return when unread output matches this regex")
+    w.add_argument("--gmcp", metavar="PACKAGE",
+                   help="return when this GMCP package next updates (e.g. Char.Vitals)")
+    w.add_argument("--max", type=float, default=30.0,
+                   help="give up after this many seconds (default 30)")
+    add_json(w)
+
+    g = sub.add_parser("gmcp", help="send a GMCP message to the server")
+    g.add_argument("package", help="GMCP package, e.g. Char.Skills.Get")
+    g.add_argument("payload", nargs="*", help="JSON payload (joined with spaces)")
+    add_json(g)
 
     st = sub.add_parser("state", help="print captured GMCP game state as JSON")
     st.add_argument("--key", help="print only one package, e.g. Char.Vitals or Room.Info")
+    st.add_argument("--times", action="store_true",
+                    help="print seconds since each package last updated")
+    add_json(st)
 
-    sub.add_parser("status", help="show connection + vitals summary")
-    sub.add_parser("close", help="close the session and stop the daemon")
+    stat = sub.add_parser("status", help="show connection + vitals summary")
+    add_json(stat)
 
-    lg = sub.add_parser("log", help="print the full session output log")
-    lg.add_argument("--tail", type=int, default=0, help="only the last N characters (0 = all)")
+    cl = sub.add_parser("close", help="close the session and stop the daemon")
+    add_json(cl)
+
+    sub.add_parser("kill", help="force-stop a wedged daemon and clear the session")
+
+    lg = sub.add_parser("log", help="print the session output log")
+    lg.add_argument("--tail", type=int, default=0, help="only the last N lines (0 = all)")
     return p
 
 
+def _daemon_argv() -> argparse.Namespace:
+    dp = argparse.ArgumentParser(prog="automud --daemon")
+    dp.add_argument("--dir", required=True)
+    dp.add_argument("--host", required=True)
+    dp.add_argument("--port", type=int, required=True)
+    dp.add_argument("--tls", action="store_true")
+    dp.add_argument("--tls-insecure", action="store_true")
+    dp.add_argument("--encoding", default="utf-8")
+    dp.add_argument("--idle-exit", type=float, default=0.0)
+    dp.add_argument("--debug", action="store_true")
+    return dp.parse_args(sys.argv[2:])
+
+
 def main() -> None:
-    # MUD text is UTF-8. Force it on stdout/stderr so non-ASCII output (box drawing, accents,
-    # CJK, emoji) never raises UnicodeEncodeError when the console codepage is narrow or the
-    # output is captured/redirected, which is exactly how an agent runs this.
+    # MUD text is UTF-8 by default. Force it on stdout/stderr so non-ASCII output (box
+    # drawing, accents, CJK, emoji) never raises UnicodeEncodeError when the console
+    # codepage is narrow or the output is captured/redirected, which is exactly how an
+    # agent runs this.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
 
-    if len(sys.argv) >= 4 and sys.argv[1] == "--daemon":
-        asyncio.run(_daemon_main(sys.argv[2], int(sys.argv[3])))
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        a = _daemon_argv()
+        _set_state_dir(a.dir)
+        asyncio.run(_daemon_main(a.host, a.port, tls=a.tls, tls_insecure=a.tls_insecure,
+                                 encoding=a.encoding, idle_exit=a.idle_exit, debug=a.debug))
         return
 
     args = build_parser().parse_args()
+    _set_state_dir(os.path.join(STATE_BASE, args.session))
+
     if args.cmd == "connect":
         if args.demo:
             host, port = DEMOS[args.demo]
@@ -673,17 +1347,34 @@ def main() -> None:
         else:
             print("usage: connect HOST PORT   |   connect --demo NAME")
             sys.exit(2)
-        sys.exit(cmd_connect(host, port, quiet=args.quiet, maxw=args.max))
+        sys.exit(cmd_connect(host, port, quiet=args.quiet, maxw=args.max, tls=args.tls,
+                             tls_insecure=args.tls_insecure, encoding=args.encoding,
+                             idle_exit=args.idle_exit, debug=args.debug,
+                             json_mode=args.json))
     elif args.cmd == "send":
-        sys.exit(cmd_send(" ".join(args.text), quiet=args.quiet, maxw=args.max))
+        if args.stdin:
+            if args.text:
+                print("send: give text on argv or --stdin, not both")
+                sys.exit(2)
+            text = sys.stdin.read().rstrip("\n")
+        else:
+            text = " ".join(args.text)
+        sys.exit(cmd_send(text, quiet=args.quiet, maxw=args.max, json_mode=args.json))
     elif args.cmd == "recv":
-        sys.exit(cmd_recv(quiet=args.quiet, maxw=args.max))
+        sys.exit(cmd_recv(quiet=args.quiet, maxw=args.max, block=not args.nowait,
+                          json_mode=args.json))
+    elif args.cmd == "wait":
+        sys.exit(cmd_wait(args.pattern, args.gmcp, maxw=args.max, json_mode=args.json))
+    elif args.cmd == "gmcp":
+        sys.exit(cmd_gmcp(args.package, " ".join(args.payload), json_mode=args.json))
     elif args.cmd == "state":
-        sys.exit(cmd_state(args.key))
+        sys.exit(cmd_state(args.key, times=args.times, json_mode=args.json))
     elif args.cmd == "status":
-        sys.exit(cmd_status())
+        sys.exit(cmd_status(json_mode=args.json))
     elif args.cmd == "close":
-        sys.exit(cmd_close())
+        sys.exit(cmd_close(json_mode=args.json))
+    elif args.cmd == "kill":
+        sys.exit(cmd_kill())
     elif args.cmd == "log":
         sys.exit(cmd_log(tail=args.tail))
 
