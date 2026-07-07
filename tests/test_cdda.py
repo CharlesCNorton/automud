@@ -225,6 +225,25 @@ class TestCharacterSheet(unittest.TestCase):
         self.assertNotIn("Mood:", self.text)
 
 
+class TestCraftMenu(unittest.TestCase):
+    def setUp(self):
+        self.raw = load("craft120.txt")
+        self.lines = cd.parse(self.raw, "craft_menu")
+        self.text = "\n".join(self.lines)
+
+    def test_detected(self):
+        self.assertEqual(cd.detect_mode(self.raw), "craft_menu")
+
+    def test_options_and_details(self):
+        self.assertIn("--- Options ---", self.text)
+        self.assertIn("Remove Empty Window Frame", self.text)
+        self.assertIn("Required skills", self.text)      # the selected recipe's details
+
+    def test_no_sidebar_leak(self):
+        self.assertNotIn("L ARM", self.text)
+        self.assertNotIn("Sound:", self.text)
+
+
 class TestRejoinWrapped(unittest.TestCase):
     def test_article_keeps_space(self):
         # "support a" + "roof" must not collapse to "aroof".

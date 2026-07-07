@@ -367,6 +367,9 @@ def detect_mode(text: str) -> str:
     if "ENCUMBRANCE AND WARMT" in text or ("SPEED:" in text and "MOVE COST" in text
                                            and "Strength:" in text):
         return "character_sheet"
+    if (("Required skills" in text or "Time to complete" in text)
+            and ("Construction" in text or "Crafting" in text or "Result:" in text)):
+        return "craft_menu"
     if "< Look around >" in text:
         return "look"
     if "Inventory" in text and ("Bulk Volume" in text or "Total Weight" in text):
@@ -811,6 +814,52 @@ def _parse_overlay(raw: str) -> List[str]:
     return _unique(out)
 
 
+def _parse_craft_menu(raw: str) -> List[str]:
+    """The construction / crafting menu: a two-pane box (a list of buildable/craftable
+    things on the left, the selected one's details on the right) with the game sidebar
+    above it. Split the box interior at its internal divider so the options and the
+    selected recipe read as two clean sections."""
+    lines = raw.split("\n")
+    left = right = top = None
+    for i, line in enumerate(lines):
+        j = line.find(BOX_TL)
+        if j >= 0 and BOX_H in line:
+            k = line.find(BOX_TR, j + 1)
+            if k - j > 30:
+                left, right, top = j, k, i
+                break
+    if top is None:
+        return _parse_panel(raw)
+    div = lines[top].find(BOX_T, left + 1)            # ┬ marks the internal divider column
+    bottom = len(lines)
+    for i in range(top + 1, len(lines)):
+        if left < len(lines[i]) and lines[i][left] == BOX_BL:
+            bottom = i
+            break
+    names, details = [], []
+    for line in lines[top + 1:bottom]:
+        interior = line[left + 1:right]
+        if div > left:
+            lcol = _clean(_strip_list_markers(interior[:div - left - 1]))
+            rcol = _clean(interior[div - left:])
+        else:
+            lcol, rcol = _clean(interior), ""
+        if lcol and any(c.isalpha() for c in lcol) and not lcol.startswith(("<<", "All ")):
+            names.append(lcol)
+        if rcol and any(c.isalpha() for c in rcol) and not rcol.startswith("Press "):
+            details.append(rcol)
+    out = []
+    if names:
+        out.append("--- Options ---")
+        out.extend(_unique(names))
+    details = _rejoin_wrapped([d for d in details if d])
+    if details:
+        out.append("")
+        out.append("--- Selected ---")
+        out.extend(details)
+    return out
+
+
 def _parse_character_sheet(raw: str) -> List[str]:
     """The @ character screen: a multi-column panel (stats, encumbrance, speed, then a
     description) occupying the left of the screen, with the game sidebar and map still
@@ -858,6 +907,8 @@ def parse(raw: str, mode: str) -> List[str]:
         return _parse_surroundings(raw)
     if mode == "character_sheet":
         return _parse_character_sheet(raw)
+    if mode == "craft_menu":
+        return _parse_craft_menu(raw)
     if mode == "overlay":
         return _parse_overlay(raw)
     # dialogue / inventory / look render in a box laid over the game with the sidebar and
@@ -1663,7 +1714,7 @@ def _drain_distractions(deadline_s: float, ignore: bool = True) -> str:
             else:
                 return raw
         elif "trouble sleeping" in low:
-            send_keys("C")
+            send_keys("c")                        # "c Continue trying to fall asleep"
             time.sleep(0.3)
     return capture_raw()
 
@@ -1744,13 +1795,17 @@ def wait_atomic(spec: str) -> str:
     send_keys("|")
     raw = wait_for_change(before=raw, timeout=1.0)
     text = strip_ansi(raw)
-    # Verify the wait menu actually opened before sending the duration key: otherwise that
-    # key ("2", ...) would be a stray movement command in the game.
+    # With an alarm clock (a smartphone counts), | first opens "Wait a while / Set an
+    # alarm"; pick "Wait a while" to reach the duration menu. This must run BEFORE the
+    # duration-menu check, or that check aborts on the alarm prompt.
+    if "alarm clock" in text.lower() or "Wait a while" in text:
+        send_keys("w")
+        raw = wait_for_change(timeout=1.0)
+        text = strip_ansi(raw)
+    # Verify the duration menu is up before sending its key: otherwise that key ("2", ...)
+    # would be a stray movement command in the game.
     if "wait for how long" not in text.lower() and "wait till" not in text.lower():
         raise CddaError("the wait menu did not open (are you in normal game mode?)")
-    if "alarm clock" in text.lower():
-        send_keys("w")
-        wait_for_change(timeout=1.0)
     send_keys(key)
     time.sleep(0.5)
     return _drain_distractions(90, ignore=True)

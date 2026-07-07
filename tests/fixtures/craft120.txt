@@ -1,0 +1,40 @@
+﻿                                   ───{...                                   L ARM   |||||  HEAD    |||||  R ARM  |||||
+                                   ..@..##                                   L LEG   |||||  TORSO   |||||  R LEG  |||||
+                                   ...@...                                   Sound: 0       Mood: :|       Focus: 100
+                                   .....##                                   Stam: |||||    Speed: 100     Move: 0(W)
+                                   .......                                   Str: 8         Dex: 8         Power: --
+┌─ Construction ──────────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+│<< All >>                                    │ Remove Empty Window Frame                                              │
+├─────────────────────────────────────────────┤                                                                        │
+^Remove Empty Window Frame                    │ Stage/Variant #1: floor                                                │
+│Remove Concrete Floor                        │ Result: Interlocking wooden tiles that are more than likely treated    │
+│Remove Reinforced Concrete Floor             │ against fire, with wooden posts and beams that can support a roof.     │
+│Remove Linoleum Tiles                        │ Required skills: fabrication (3)                                       │
+│Remove Wooden Floor                          │ Requires: empty window                                                 │
+│Remove Concrete Wall                         │ Time to complete: 1 hour                                               │
+│Remove Reinforced Concrete Wall              │ Tools required:                                                        │
+│Remove Wall                                  │ > 1 tool with hammering of 2 or more.                                  │
+│Remove Rock Wall                             │ > 1 tool with chiseling of 2 or more.                                  │
+│Remove Brick Wall                            │ > 1 tool with prying of 1 or more.                                     │
+│Remove Wooden Wall                           │ > 1 tool with digging of 3 or more.                                    │
+│Remove Segment of Road/Sidewalk              │ > bronze nail puller OR claw bar OR nail puller                        │
+│Remove Metal Door                            │                                                                        │
+│Remove Rebar Cage                            │ Stage/Variant #2: floor                                                │
+│Remove Concrete Column                       │ Result: Interlocking wooden tiles that are more than likely treated    │
+│Remove Glass Wall                            │ against fire, with wooden posts and beams that can support a roof.     │
+│Remove glass door                            │ Required skills: fabrication (3)                                       │
+│Deconstruct Fireplace                        │ Requires: empty metal window frame                                     │
+│Place Battery Charger                        │ Time to complete: 1 hour                                               │
+│Place Recharging Station                     │ Tools required:                                                        │
+│Place Air Compressor                         │ > 1 tool with hammering of 2 or more.                                  │
+│Place Makeshift Ammonia Machine Pipework     │ > 1 tool with chiseling of 2 or more.                                  │
+│Place Makeshift Ammonia Machine Reactor      │ > 1 tool with prying of 3 or more.                                     │
+│Place Home Freezer                           │ > 1 tool with digging of 3 or more.                                    │
+│Place Arcade Machine                         │ > angle grinder (200 charges)                                          │
+│Place ASRG                                   │                                                                        │
+│Place Autoclave                              │                                                                        │
+│Place Band Saw                               │ Press [h, LEFT, or 4 or l, RIGHT, or 6] to tab.                        │
+│Place Large Battery                          │ Press [f, F, or /] to search.                                          │
+│Place Car Battery                            │ Filter: All — Press [;] to cycle.                                      │
+vPlace Motorbike Battery                      │ Press [?] to view and edit keybindings.                                │
+└─────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────┘
