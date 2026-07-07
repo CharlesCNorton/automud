@@ -64,6 +64,76 @@ automud wait --for "^You (win|die)" --max 120 --json
 Exit codes: `0` ok, `1` failure, `2` usage error, `3` the operation succeeded but the
 connection is closed.
 
+## Driving it with an agent
+
+There is no agent mode and nothing to configure: an agent drives the same verbs a person
+does, and everything past that is behavior. One pattern is worth writing down because it
+falls out of the design. Since the agent holding the session sits between the user and
+the wire, it can be the user's entire interface to the game and re-voice everything that
+crosses it: a total conversion of the setting, applied live. The user names the world
+they want in conversation ("Achaea, but it is Paris on the 14th of July 1789 and I am a
+hated noble"), and from then on the agent translates both directions, the user's stated
+intent into real commands and the raw replies into the agreed fiction, mechanics
+included if the user wants them (vitals re-skinned as a HUD). What keeps it honest:
+
+- The theme is the user's to pick. If they have not said what they want, ask; do not
+  invent on their behalf.
+- Translate, do not decide. The user's intent picks the command, and the server's actual
+  reply decides what happened. Failures and deaths render in-fiction, but they render.
+- Keep the mapping stable: the same room, denizen, or stat appears under the same
+  converted name every time.
+- `out.log` keeps the untranslated transcript, so the fiction is always auditable
+  against what the server really said.
+
+## Local single-player (Cataclysm)
+
+`automud connect cdda` launches a local game of [Cataclysm: Dark Days
+Ahead](https://cataclysmdda.org) and drives it through the same verbs, so there is a
+world to play even with no MUD to connect to, an obligate single-player mode for when
+every public server is finally gone. It is a second *backend*: a persistent tmux session
+holds the game open the way the telnet daemon holds a socket, and `send` / `recv` /
+`wait` / `state` / `status` / `close` all work against it.
+
+Requirements: `tmux` and a terminal `cataclysm` binary. On Windows the game runs in WSL
+and automud bridges to it automatically (`AUTOMUD_CDDA_DISTRO` selects the distro;
+`AUTOMUD_CDDA_DIR` / `AUTOMUD_CDDA_BIN` / `AUTOMUD_CDDA_LAUNCH` point at the binary).
+
+```
+automud connect cdda
+automud send north              # move; the reply is the message log + a status line
+automud send examine east       # a named action, not the seven keystrokes e-x-a-m-i-n-e
+automud send nearby             # list items/creatures around you (no map needed)
+automud state                   # the character as JSON: stats, hp, needs, place, threats
+automud send help               # the action vocabulary for the current screen
+```
+
+**The map is obscured on purpose.** A blurry ASCII minimap is neither reliable for a
+language model to parse nor necessary to one that reads a room description, so game-mode
+output is the message log plus a structured status line (vitals, place, time, nearby
+threats), never the tilemap. Ask for spatial detail when you want it: `send look`,
+`send examine <dir>`, `send nearby`.
+
+**Actions, not raw keys.** `send` understands word directions (`north`, `se`), named
+keys (`enter`, `escape`), and named game actions (`examine`, `pickup`, `eat`, `wait`,
+`wield`, ...) that map to the right key. An unrecognized word is reported, not typed out
+letter by letter. Single characters are still sent literally, so raw CDDA keys work too.
+
+**Character creation is one line per choice.** The finicky chargen menus are wrapped:
+
+```
+automud send scenario Sheltered
+automud send profession "Sheltered Survivor"    # or: send class ...
+automud send stats 8 10 10 10                    # STR DEX INT PER; reports the real values
+automud send trait Fleet-Footed
+automud send name Dougal
+automud send finalize
+```
+
+Each reports what it actually committed (and refuses a locked or mismatched entry rather
+than silently selecting the wrong one), and in chargen `state` returns the build so far
+(scenario, profession, stats, name). The missing-mod prompts a fresh world throws are
+cleared automatically.
+
 ## Behaviour
 
 - **Smart waiting.** `send` and `recv` return as soon as the server stops talking, either a

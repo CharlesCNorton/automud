@@ -34,6 +34,13 @@ What the daemon does for you:
   * TLS: --tls wraps the connection (--tls-insecure skips certificate checks for MUDs
     with self-signed certs).
 
+An agent driving these verbs can also be its user's entire interface to the game: the
+user names a setting in conversation, and the agent re-voices both directions live,
+intent into real commands and raw replies into the agreed fiction (a total conversion,
+with no mode or flag in here). Ask for the theme rather than inventing it, let the
+server's actual replies decide events, keep converted names stable, and remember that
+out.log stays the untranslated record.
+
 The control channel is a localhost-only socket gated by a per-session token kept in a
 private (0700) per-user state directory, so only processes running as you can drive the
 session. The daemon pid is tracked: stale sessions are detected and cleared, and `kill`
@@ -64,7 +71,7 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 
 # ------------------------------ state directory ------------------------------
@@ -1284,7 +1291,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Verbs: connect / send / recv / wait / gmcp / state / status / log / close / "
                "kill / sites.\n"
-               "Run 'automud sites' for a directory of verified public targets.\n"
+               "Run 'automud sites' for a directory of verified public targets, or "
+               "'automud connect cdda' for the bundled single-player game (Cataclysm, "
+               "needs tmux + a cataclysm binary; see the README).\n"
                "Exit codes: 0 ok; 1 failure; 2 usage; 3 ok but the connection is closed.")
     p.add_argument("--version", action="version", version="automud %s" % __version__)
     p.add_argument("-s", "--session", default="default", metavar="NAME",
@@ -1302,7 +1311,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print the full structured response as one JSON object")
 
     c = sub.add_parser("connect", help="open a session (starts the background daemon)")
-    c.add_argument("host", nargs="?", help="telnet host, or a site name from 'sites'")
+    c.add_argument("host", nargs="?",
+                   help="telnet host, a site name from 'sites', or 'cdda' for the local "
+                        "single-player game")
     c.add_argument("port", nargs="?", type=int, help="telnet port")
     c.add_argument("--demo", metavar="NAME",
                    help="connect to a named site from the directory (see 'sites')")
@@ -1406,6 +1417,20 @@ def main() -> None:
     args = build_parser().parse_args()
     _set_state_dir(os.path.join(STATE_BASE, args.session))
 
+    # Local single-player backend: `connect cdda` launches Cataclysm in tmux instead of
+    # opening a socket, and the other verbs route to it while its session is active. The
+    # telnet path below is never touched.
+    if args.cmd == "connect":
+        target = (args.demo or "").lower() or (args.host.lower() if args.host else "")
+        if target == "cdda":
+            import automud_cdda
+            sys.exit(automud_cdda.cmd_connect(json_mode=args.json))
+    elif args.cmd in ("send", "recv", "wait", "state", "status", "close", "kill", "log"):
+        _sess = _read_session()
+        if _sess and _sess.get("backend") == "cdda":
+            import automud_cdda
+            sys.exit(automud_cdda.dispatch(args))
+
     if args.cmd == "connect":
         name = (args.demo or "").lower() or \
                (args.host.lower() if args.host and not args.port else "")
@@ -1455,4 +1480,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # Output was piped into something that closed early (head, a truncating pager).
+        # Redirect stdout to devnull so the interpreter's final flush doesn't re-raise,
+        # and exit quietly instead of dumping a traceback.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(0)

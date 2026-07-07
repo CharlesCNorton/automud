@@ -1,0 +1,40 @@
+﻿.....                                                                        L ARM   |||||  HEAD    |||||  R ARM  |||||
+.......          7.                                                          L LEG   |||||  TORSO   |||||  R LEG  |||||
+........         ...                                                         Sound: 5       Mood: :|       Focus: 100
+..........        ...                                                        Stam: ||||\    Speed: 100     Move: 102(W)
+............       ...                                                       Str: 8         Dex: 12        Power: --
+.............       ...                                                      Int: 10        Per: 8         Safe: On
+...............      ...                                                     Weariness: Fresh      Activity: Moderate
+.................     ...                                                    Transition: |||||     Weary Malus: +  0%
+..................     ...                                                   Pain:                 Thirst:
+....................    ...                                                  Rest:                 Hunger:
+......................   ...                                                 Heat: Comfortable     Weight: Overweight
+.......................   ...                                                Owner:    None              ..┌┴─┐FFF#└###
+.........................  ...                                               Place:   evac shelter A-23  ┌─┘FF└┐FFF####
+........................... ...                                              Lighting: bright            #.FFFF└+FF####
+............................ ...                                             Weather:  Sunny             ###FFFFFFF####
+.................................                                            Snow:                       ####FFFFF#####
+..................................                                           Moon:     Half moon
+.....*.............................                                          Date:     Thursday, Dec 21
+....................................┌──"────"┐                               Time:     8:00:47 AM
+....................................│6.......│                               Wind: Calm ⇗          Temperature: -
+....................................".@.#....+                               Wield: fists
+..7#.............................───┘####....│                               Style: No style
+........,.#..............         ........┌+─┘                               NW:            N:             NE:
+.........#......                  ........│                                  W:      D                     E:
+.......                           ........│                                  SW:            S:             SE:
+                                  ........{{{..                              D deer
+                                  .............
+                                  ...#.#.#.│.##
+                                  ...#.#.#.│...                              Weight :  3.5/99.2 lbs
+                                  ...#.#.#.│ #                               You open the window with curtains.
+                                  ─│.#.#.#.│                                 Never mind.
+                                   ".#.#.#.│                                 You bring your knee down on the white
+                                   │.........                                concrete wall, smashing it.
+                                   └───"────"                                You hear whump!
+                                                                             You bring your knee down on the white
+                                                                             concrete wall, smashing it.
+                                                                             You hear whump!
+                                                                             Moving off of this cupboard is slow!
+                                                                             Moving onto this cupboard is slow!
+                                                                             Moving off of this cupboard is slow!

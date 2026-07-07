@@ -28,7 +28,7 @@ Source = "https://github.com/CharlesCNorton/automud"
 automud = "automud:main"
 
 [tool.setuptools]
-py-modules = ["automud"]
+py-modules = ["automud", "automud_cdda"]
 
 [tool.setuptools.dynamic]
 version = { attr = "automud.__version__" }
