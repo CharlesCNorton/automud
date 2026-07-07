@@ -367,6 +367,9 @@ def detect_mode(text: str) -> str:
     if "ENCUMBRANCE AND WARMT" in text or ("SPEED:" in text and "MOVE COST" in text
                                            and "Strength:" in text):
         return "character_sheet"
+    if "Crafting" in text and ("[RETURN] Craft" in text or "FAVORITE" in text
+                               or ("WEAPON" in text and "APPLIANCE" in text)):
+        return "recipe_menu"
     if (("Required skills" in text or "Time to complete" in text)
             and ("Construction" in text or "Crafting" in text or "Result:" in text)):
         return "craft_menu"
@@ -814,6 +817,18 @@ def _parse_overlay(raw: str) -> List[str]:
     return _unique(out)
 
 
+def _parse_recipe_menu(raw: str) -> List[str]:
+    """The & crafting recipe browser: a full-screen menu (category tabs across the top,
+    the recipe list, and key hints at the bottom) with no game sidebar, so keep every
+    readable line. An empty list just means nothing is craftable from what's on hand."""
+    out = []
+    for line in raw.split("\n"):
+        cleaned = _clean(line)
+        if cleaned and any(c.isalpha() for c in cleaned) and not is_map_segment(cleaned):
+            out.append(cleaned)
+    return _rejoin_wrapped(_unique(out))
+
+
 def _parse_craft_menu(raw: str) -> List[str]:
     """The construction / crafting menu: a two-pane box (a list of buildable/craftable
     things on the left, the selected one's details on the right) with the game sidebar
@@ -907,6 +922,8 @@ def parse(raw: str, mode: str) -> List[str]:
         return _parse_surroundings(raw)
     if mode == "character_sheet":
         return _parse_character_sheet(raw)
+    if mode == "recipe_menu":
+        return _parse_recipe_menu(raw)
     if mode == "craft_menu":
         return _parse_craft_menu(raw)
     if mode == "overlay":

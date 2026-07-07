@@ -1,0 +1,40 @@
+﻿  Crafting
+  * +    WEAPON +    AMMO +    FOOD +    CHEM +    ELECTRONIC +    ARMOR +    APPLIANCE                    Crafter: You]
+  FAVORITE    RECENT    HIDDEN    NESTED +                                                   * No hidden recipe - 0 in
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ [RETURN] Craft, D[e]scribe, [f]ilter, [r]eset filter, [v] Read/unread, [V] Mark all as read, Show [u]nread recipes
+ first, [n/a] Show/hide, Re[L]ated, [*] Favorite, [b]atch, Batch [+], Batch [-], [c]hoose crafter, [+] Prioritize, [-
+ ] Deprioritize, [SPACE] Navigate details, [?] Keybindings
+

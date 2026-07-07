@@ -244,6 +244,24 @@ class TestCraftMenu(unittest.TestCase):
         self.assertNotIn("Sound:", self.text)
 
 
+class TestRecipeMenu(unittest.TestCase):
+    def setUp(self):
+        self.raw = load("recipe120.txt")
+        self.lines = cd.parse(self.raw, "recipe_menu")
+        self.text = "\n".join(self.lines)
+
+    def test_detected(self):
+        self.assertEqual(cd.detect_mode(self.raw), "recipe_menu")
+
+    def test_tabs_and_hints(self):
+        self.assertIn("Crafting", self.text)
+        self.assertIn("WEAPON", self.text)
+        self.assertIn("Craft", self.text)               # the [RETURN] Craft hint
+
+    def test_not_garbled_as_game(self):
+        self.assertNotEqual(cd.detect_mode(self.raw), "game")
+
+
 class TestRejoinWrapped(unittest.TestCase):
     def test_article_keeps_space(self):
         # "support a" + "roof" must not collapse to "aroof".
