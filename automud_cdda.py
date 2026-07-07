@@ -715,6 +715,48 @@ def _parse_surroundings(raw: str) -> List[str]:
     return _rejoin_wrapped(_unique(out))
 
 
+def _parse_panel(raw: str) -> List[str]:
+    """A dialogue box or an NPC interaction menu, both of which render OVER the game with
+    the sidebar (and sometimes map) still visible around them. When a bordered box is
+    present, slice to its interior so the sidebar to the right of the box and any map
+    bleeding through its edge are dropped. Otherwise keep menu rows and prose while
+    discarding map runs."""
+    lines = raw.split("\n")
+    left = right = top = None
+    for idx, line in enumerate(lines):
+        i = line.find(BOX_TL)
+        if i >= 0:
+            j = line.find(BOX_TR, i + 1)
+            if j - i > 10:
+                left, right, top = i, j, idx
+                break
+    out = []
+    if left is not None:
+        # Only the rows BETWEEN this box's top and bottom border: the sidebar above it
+        # and the message log below it also sit in this column range and would leak.
+        bottom = len(lines)
+        for idx in range(top + 1, len(lines)):
+            if left < len(lines[idx]) and lines[idx][left] == BOX_BL:
+                bottom = idx
+                break
+        for line in lines[top + 1:bottom]:
+            if len(line) <= left:
+                continue
+            seg = _clean(line[left + 1:right])
+            if seg and not is_map_segment(seg):
+                out.append(seg)
+    else:
+        for line in lines:
+            for seg in re.split(r" {2,}", line):
+                seg = seg.strip()
+                if not seg or is_map_segment(seg):
+                    continue
+                if (re.match(r"^[A-Za-z][):]?\s+[A-Za-z]", seg) or seg.endswith("?")
+                        or (" " in seg and any(c.islower() for c in seg))):
+                    out.append(seg)
+    return _rejoin_wrapped(_unique(out))
+
+
 def _parse_loading(raw: str) -> List[str]:
     out = []
     for line in raw.split("\n"):
@@ -739,8 +781,10 @@ def parse(raw: str, mode: str) -> List[str]:
         return _parse_loading(raw)
     if mode == "surroundings":
         return _parse_surroundings(raw)
-    # look, inventory, dialogue, popup, pause_menu, world_create, mod_prompt,
-    # debug_popup, extended, keybindings: all bordered panels.
+    if mode in ("dialogue", "overlay"):
+        return _parse_panel(raw)
+    # look, inventory, popup, pause_menu, world_create, mod_prompt, debug_popup,
+    # extended, keybindings: all clean bordered panels.
     return extract_boxed(raw)
 
 

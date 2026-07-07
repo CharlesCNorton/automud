@@ -129,6 +129,32 @@ class TestLookPanel(unittest.TestCase):
         self.assertIn("Floor", text)
 
 
+class TestDialogue(unittest.TestCase):
+    """Dialogue renders in a box over the live game; the parser must slice to the box
+    interior so the sidebar beside it and the message log below it do not leak in."""
+
+    def setUp(self):
+        self.lines = cd.parse(load("dialogue120.txt"), "dialogue")
+        self.text = "\n".join(self.lines)
+
+    def test_npc_speech_and_quest(self):
+        self.assertIn("Dialogue: Dino Hutchison", self.text)
+        self.assertIn("put her out of her misery", self.text)
+
+    def test_response_options_present(self):
+        self.assertIn("I'll do it!", self.text)
+        self.assertIn("Not interested.", self.text)
+
+    def test_no_sidebar_leak(self):
+        # The HP bar row and stat lines sit level with the box but outside it.
+        self.assertNotIn("L ARM", self.text)
+        self.assertNotIn("Sound:", self.text)
+
+    def test_no_message_log_leak(self):
+        # The message log below the box must not bleed up into the dialogue.
+        self.assertNotIn("Faction succession", self.text)
+
+
 class TestTokenVocabulary(unittest.TestCase):
     def test_directions(self):
         self.assertEqual(cd._token_key("north"), "k")

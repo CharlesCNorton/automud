@@ -1,0 +1,40 @@
+﻿                                                                             L ARM   |||||  HEAD    |||||  R ARM  |||||
+                                                                             L LEG   |||||  TORSO   |||||  R LEG  |||||
+                                                                             Sound: 5       Mood: :|       Focus: 100
+                                                                             Stam: |||||    Speed: 100     Move: 0(W)
+          ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐er: --
+          │ Dialogue: Dino Hutchison                                                                         │e: On
+          │                                                                                                  │oderate
+          │Dino Hutchison                                                                                    │: +  0%
+          │"Oh god, I can't believe it happened…"                                                            │
+          │                                                                                                  │
+          │You                                                                                               │rweight
+          │What's the matter?                                                                                │#FF│F.RR#
+          │                                                                                                  │FFF│F┌>──
+          │Dino Hutchison                                                                                    │FF+┼─┤RRR
+          │"My mom… she's… she was killed, but then she just got back up… she's one of those things now.  Can│F┌─┘F│RRR
+          │you put her out of her misery for me?"                                                            │F│FFF└┐RR
+          │                                                                                                  │
+          │                                                                                                  │
+          │                                                                                                  │
+          ├──────────────────────────────────────────────────────────────────────────────────────────────────┤: -
+          │ Your response:                                                                                   │
+          │  a: I'll do it!                                   L: Look at                                     │
+          │  b: Not interested.                               S: Size up stats                               │
+          │                                                   A: Assess personality                          │
+          │                                                   Y: Yell                                        │
+          │                                                   O: Check opinion                               │
+          │                                                                                                  │
+          │                                                                                                  │
+          │                                                                                                  │
+          │                                                                                                  │
+          │                                                                                                  │
+          │                                                                                                  │
+          │                                                                                                  │
+          │                                                                                                  │
+          │                                                                                                  │
+          └──────────────────────────────────────────────────────────────────────────────────────────────────┘e of
+                                                                             panic, and have achieved (relative) safety
+                                                                             in one of the many government evac
+                                                                             shelters.
+                                                                             Mission "Faction succession" is failed.
