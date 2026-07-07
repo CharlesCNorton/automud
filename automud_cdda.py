@@ -30,6 +30,7 @@ Configuration (all optional):
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -115,13 +116,13 @@ DIRECTIONS = {
 # behaviour, where the 'i' in "examine" popped the inventory). Actions that need a
 # follow-up (direction, menu choice) are driven by sending the follow-up as the next
 # token.
+# pickup / eat / wait / sleep are NOT here: they are high-level actions (below) that drive
+# their whole multi-prompt flow to completion, rather than just opening the menu.
 GAME_ACTIONS = {
     "look": "x", "examine": "e", "inventory": "i", "inv": "i",
-    "pickup": "g", "grab": "g", "get": "g", "take": "g",
-    "eat": "E", "drink": "E", "consume": "E",
     "wield": "w", "wear": "W", "takeoff": "T",
     "read": "R", "craft": "&", "construct": "*",
-    "wait": "|", "sleep": "$", "fire": "f", "throw": "t", "reload": "r",
+    "fire": "f", "throw": "t", "reload": "r",
     "drop": "d", "apply": "a", "use": "a", "activate": "a",
     "smash": "s", "bash": "s", "open": "o", "close": "c",
     "unload": "U", "butcher": "B", "chat": "C", "talk": "C", "safemode": "!",
@@ -168,7 +169,12 @@ def _auto_distro() -> str:
 def _tmux_argv(*args: str) -> List[str]:
     tmux = os.environ.get("AUTOMUD_CDDA_TMUX", "tmux")
     if os.name == "nt":
-        return ["wsl.exe", "-d", DISTRO or _auto_distro(), "--", tmux, *args]
+        # wsl.exe hands the post-`--` command to a shell, so a bare key like `|` (wait),
+        # `$` (sleep) or `&` (craft) becomes a shell metacharacter and errors. Build the
+        # command as one bash -c string with every argument shell-quoted, so those keys
+        # reach tmux literally.
+        inner = " ".join(shlex.quote(a) for a in (tmux, *args))
+        return ["wsl.exe", "-d", DISTRO or _auto_distro(), "--", "bash", "-c", inner]
     return [tmux, *args]
 
 
@@ -358,6 +364,9 @@ def detect_mode(text: str) -> str:
         if "<%sTRAITS%s>" % (BOX_VERT, BOX_VERT) in text:
             return "chargen_traits"
         return "chargen"
+    if "ENCUMBRANCE AND WARMT" in text or ("SPEED:" in text and "MOVE COST" in text
+                                           and "Strength:" in text):
+        return "character_sheet"
     if "< Look around >" in text:
         return "look"
     if "Inventory" in text and ("Bulk Volume" in text or "Total Weight" in text):
@@ -802,6 +811,27 @@ def _parse_overlay(raw: str) -> List[str]:
     return _unique(out)
 
 
+def _parse_character_sheet(raw: str) -> List[str]:
+    """The @ character screen: a multi-column panel (stats, encumbrance, speed, then a
+    description) occupying the left of the screen, with the game sidebar and map still
+    visible to its right. Keep the left panel up to the sidebar column, split its internal
+    columns, and drop map runs and the sidebar's bar fragments."""
+    col = min(_sidebar_col(raw), 78)                  # the panel is ~78 wide; sidebar beyond
+    out = []
+    for line in raw.split("\n"):
+        left = line[:col] if len(line) > col else line
+        # Split only on the column borders, so each cell keeps its label WITH its value
+        # ("Strength:  8 ( 8)"); collapse the padding for readability.
+        for cell in left.split("│"):
+            cell = re.sub(r"\s+", " ", _clean(cell)).strip()
+            if not cell or is_map_segment(cell):
+                continue
+            if sum(c.isalpha() for c in cell) < 2:    # drop bar fragments like "M |||||"
+                continue
+            out.append(cell)
+    return _rejoin_wrapped(_unique(out))
+
+
 def _parse_loading(raw: str) -> List[str]:
     out = []
     for line in raw.split("\n"):
@@ -826,6 +856,8 @@ def parse(raw: str, mode: str) -> List[str]:
         return _parse_loading(raw)
     if mode == "surroundings":
         return _parse_surroundings(raw)
+    if mode == "character_sheet":
+        return _parse_character_sheet(raw)
     if mode == "overlay":
         return _parse_overlay(raw)
     # dialogue / inventory / look render in a box laid over the game with the sidebar and
@@ -1590,6 +1622,193 @@ def _emit_action(result: dict, json_mode: bool, prose_prefix: str = "") -> int:
     return 0 if result.get("ok", True) else 1
 
 
+# Recurring "Stop ...?" interrupts during a wait/sleep that are safe to ignore and keep
+# going, rather than aborting the whole activity.
+KNOWN_DISTRACTIONS = (
+    "dehydrated", "parched", "thirsty", "hungry", "famished", "starving",
+    "asthma attack", "mouth feels so dry", "cold and shiver", "getting chilly",
+    "hypothermia", "feel cruddy",
+)
+WAIT_SPEC_TO_KEY = {
+    "20s": "1", "1m": "2", "5m": "3", "30m": "4", "1h": "5", "2h": "6", "3h": "7",
+    "6h": "8", "daylight": "d", "noon": "n", "night": "k", "midnight": "m",
+}
+
+
+def _is_stop_confirm(raw: str) -> bool:
+    text = strip_ansi(raw)
+    return "Case Sensitive" in text and ("Stop " in text or "are you sure" in text.lower())
+
+
+def _drain_distractions(deadline_s: float, ignore: bool = True) -> str:
+    """Poll during a wait/sleep: press I to shrug off a known recurring distraction and
+    keep going, bail on a novel interrupt, keep trying to sleep through 'trouble
+    sleeping'. Returns when the activity ends or the deadline passes."""
+    end = time.time() + deadline_s
+    last = capture_raw()
+    while time.time() < end:
+        time.sleep(0.4)
+        raw = capture_raw()
+        if raw == last:
+            continue
+        last = raw
+        low = strip_ansi(raw).lower()
+        if "finish waiting" in low or "you wake up" in low or "you fall asleep" in low:
+            time.sleep(0.4)
+            continue
+        if _is_stop_confirm(raw):
+            if ignore and any(d in low for d in KNOWN_DISTRACTIONS):
+                send_keys("I")
+                time.sleep(0.3)
+            else:
+                return raw
+        elif "trouble sleeping" in low:
+            send_keys("C")
+            time.sleep(0.3)
+    return capture_raw()
+
+
+def pickup_atomic(name: Optional[str]) -> Tuple[str, bool]:
+    """g, optionally filter to NAME, mark the first match, confirm - the whole pickup in
+    one call instead of a menu the caller has to drive."""
+    raw = capture_raw()
+    send_keys("g")
+    raw = wait_for_change(before=raw, timeout=1.5)
+    text = strip_ansi(raw)
+    if "There is nothing" in text or "no items" in text.lower():
+        return raw, False
+    if "Pickup" not in text and "PICK UP" not in text.upper():
+        return raw, False
+    if name:
+        send_keys("/")
+        time.sleep(0.2)
+        for ch in name:
+            send_keys(ch)
+        send_keys("Enter")
+        time.sleep(0.4)
+    send_keys("l")                                # mark item under the cursor
+    time.sleep(0.2)
+    send_keys("Enter")                            # confirm
+    raw = wait_for_change(timeout=2.0)
+    return raw, "pick up" in strip_ansi(raw).lower()
+
+
+def consume_atomic(name: Optional[str]) -> Tuple[str, bool]:
+    """E, optionally filter to NAME, consume the first match."""
+    raw = capture_raw()
+    send_keys("E")
+    raw = wait_for_change(before=raw, timeout=1.5)
+    text = strip_ansi(raw)
+    if "Consume" not in text and "FOOD" not in text and "eat" not in text.lower():
+        return raw, False
+    if name:
+        send_keys("/")
+        time.sleep(0.2)
+        for ch in name:
+            send_keys(ch)
+        send_keys("Enter")
+        time.sleep(0.3)
+    send_keys("Enter")
+    raw = wait_for_change(timeout=2.0)
+    text = strip_ansi(raw)
+    return raw, ("You drink" in text or "You eat" in text or "You consume" in text)
+
+
+def sleep_atomic(hours: int = 8) -> Tuple[str, bool]:
+    """$, accept the sleep prompt, set an alarm, then ignore recurring distractions until
+    the character wakes (or ~90s real time)."""
+    raw = capture_raw()
+    send_keys("$")
+    raw = wait_for_change(before=raw, timeout=1.5)
+    text = strip_ansi(raw)
+    if "want to sleep" not in text.lower():
+        if "MAIN MENU" in text or "Save and quit" in text:
+            send_keys("Escape")
+            wait_for_change(timeout=0.5)
+        return raw, False
+    send_keys("Y")
+    raw = wait_for_change(timeout=1.5)
+    if "alarm" in strip_ansi(raw).lower():
+        send_keys(str(int(hours)) if 3 <= hours <= 9 else "N")
+        wait_for_change(timeout=1.0)
+    return _drain_distractions(90, ignore=True), True
+
+
+def wait_atomic(spec: str) -> str:
+    """| , pick a duration, and hold through recurring distractions."""
+    key = WAIT_SPEC_TO_KEY.get(spec)
+    if key is None:
+        raise CddaError("unknown wait spec %r; try one of: %s"
+                        % (spec, ", ".join(WAIT_SPEC_TO_KEY)))
+    raw = capture_raw()
+    send_keys("|")
+    raw = wait_for_change(before=raw, timeout=1.0)
+    text = strip_ansi(raw)
+    # Verify the wait menu actually opened before sending the duration key: otherwise that
+    # key ("2", ...) would be a stray movement command in the game.
+    if "wait for how long" not in text.lower() and "wait till" not in text.lower():
+        raise CddaError("the wait menu did not open (are you in normal game mode?)")
+    if "alarm clock" in text.lower():
+        send_keys("w")
+        wait_for_change(timeout=1.0)
+    send_keys(key)
+    time.sleep(0.5)
+    return _drain_distractions(90, ignore=True)
+
+
+def _act_pickup(args: List[str], json_mode: bool) -> int:
+    raw, ok = pickup_atomic(" ".join(args).strip() or None)
+    mode, data = _render(auto_clear(raw))
+    _log_text(data)
+    if json_mode:
+        print(json.dumps({"ok": True, "picked_up": ok, "mode": mode, "data": data}))
+        return 0
+    print("[pickup] picked_up=%s" % ok)
+    _automud()._print(data)
+    return 0
+
+
+def _act_consume(args: List[str], json_mode: bool) -> int:
+    raw, ok = consume_atomic(" ".join(args).strip() or None)
+    mode, data = _render(auto_clear(raw))
+    _log_text(data)
+    if json_mode:
+        print(json.dumps({"ok": True, "consumed": ok, "mode": mode, "data": data}))
+        return 0
+    print("[consume] consumed=%s" % ok)
+    _automud()._print(data)
+    return 0
+
+
+def _act_sleep(args: List[str], json_mode: bool) -> int:
+    hours = int(args[0]) if args and args[0].isdigit() else 8
+    raw, ok = sleep_atomic(hours)
+    mode, data = _render(auto_clear(raw))
+    _log_text(data)
+    if json_mode:
+        print(json.dumps({"ok": True, "slept": ok, "mode": mode, "data": data}))
+        return 0
+    print("[sleep] slept=%s" % ok)
+    _automud()._print(data)
+    return 0
+
+
+def _act_wait(args: List[str], json_mode: bool) -> int:
+    spec = args[0] if args else "1h"
+    try:
+        raw = wait_atomic(spec)
+    except CddaError as exc:
+        return _emit_action({"ok": False, "reason": str(exc)}, json_mode, "[wait]")
+    mode, data = _render(auto_clear(raw))
+    _log_text(data)
+    if json_mode:
+        print(json.dumps({"ok": True, "mode": mode, "data": data}))
+        return 0
+    print("[wait %s]" % spec)
+    _automud()._print(data)
+    return 0
+
+
 def _act_nearby(args: List[str], json_mode: bool) -> int:
     """Open CDDA's surroundings list (V), read the items/creatures near the player, and
     leave it. Gives the blind player an adjacency scan without walking the look cursor
@@ -1610,8 +1829,10 @@ def _act_help(args: List[str], json_mode: bool) -> int:
         "directions": "north south east west ne nw se sw (or CDDA hjkl yubn)",
         "actions": ", ".join(sorted(GAME_ACTIONS)),
         "named_keys": ", ".join(sorted(NAMED_KEYS)),
-        "info": "look/nearby for surroundings, state for vitals, examine <dir>, "
-                "pickup, eat, wait, sleep. Single letters are sent literally.",
+        "info": "look/nearby for surroundings, state for vitals, examine <dir>. "
+                "High-level (drive the whole flow): pickup [NAME], eat [NAME], "
+                "wait <20s|1m|5m|30m|1h|2h|3h|6h|daylight|noon|night>, sleep [HOURS]. "
+                "Single letters are sent literally.",
         "chargen": "newgame (menu -> character creation) | options [TAB] (list every "
                    "choice) | scenario NAME | profession NAME | background NAME | "
                    "stats STR DEX INT PER | trait NAME | name NAME | finalize",
@@ -1719,6 +1940,15 @@ _SPECIAL_ACTIONS = {
     "newgame": lambda a, j: _act_newgame(a, j),
     "options": lambda a, j: _act_options(a, j),
     "list": lambda a, j: _act_options(a, j),
+    "pickup": lambda a, j: _act_pickup(a, j),
+    "grab": lambda a, j: _act_pickup(a, j),
+    "get": lambda a, j: _act_pickup(a, j),
+    "take": lambda a, j: _act_pickup(a, j),
+    "eat": lambda a, j: _act_consume(a, j),
+    "drink": lambda a, j: _act_consume(a, j),
+    "consume": lambda a, j: _act_consume(a, j),
+    "sleep": lambda a, j: _act_sleep(a, j),
+    "wait": lambda a, j: _act_wait(a, j),
     "nearby": lambda a, j: _act_nearby(a, j),
     "surroundings": lambda a, j: _act_nearby(a, j),
     "help": lambda a, j: _act_help(a, j),

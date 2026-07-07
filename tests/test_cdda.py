@@ -203,6 +203,28 @@ class TestOverlayMenu(unittest.TestCase):
             self.assertFalse(all(c in cd.MAP_CHARS or c == " " for c in ln) and ln.strip())
 
 
+class TestCharacterSheet(unittest.TestCase):
+    def setUp(self):
+        self.raw = load("charsheet120.txt")
+        self.lines = cd.parse(self.raw, "character_sheet")
+        self.text = "\n".join(self.lines)
+
+    def test_detected(self):
+        self.assertEqual(cd.detect_mode(self.raw), "character_sheet")
+
+    def test_content_present(self):
+        self.assertIn("Strength: 8", self.text)
+        self.assertIn("SPEED: 100", self.text)
+        self.assertIn("Base HP", self.text)
+        self.assertIn("brute force", self.text)     # the stat description
+
+    def test_no_game_sidebar_leak(self):
+        # The game sidebar to the right of the panel (Weariness/Mood/Thirst rows) must not
+        # bleed in.
+        self.assertNotIn("Weariness:", self.text)
+        self.assertNotIn("Mood:", self.text)
+
+
 class TestRejoinWrapped(unittest.TestCase):
     def test_article_keeps_space(self):
         # "support a" + "roof" must not collapse to "aroof".
@@ -225,7 +247,14 @@ class TestTokenVocabulary(unittest.TestCase):
         # used to open the inventory).
         self.assertEqual(cd._token_key("examine"), "e")
         self.assertEqual(cd._token_key("inventory"), "i")
-        self.assertEqual(cd._token_key("pickup"), "g")
+        self.assertEqual(cd._token_key("wield"), "w")
+
+    def test_atomic_actions_are_special(self):
+        # pickup/eat/wait/sleep drive a whole flow, so they are special actions, not bare
+        # key-tokens (a bare key would only open the menu).
+        for action in ("pickup", "eat", "wait", "sleep"):
+            self.assertIsNone(cd._token_key(action))
+            self.assertIn(action, cd._SPECIAL_ACTIONS)
 
     def test_named_keys(self):
         self.assertEqual(cd._token_key("enter"), "Enter")

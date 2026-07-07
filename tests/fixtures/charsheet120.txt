@@ -1,0 +1,40 @@
+﻿ Grabber | Male                                    [y] Customize [m] Morale  [?]│M   |||||  HEAD    |||||  R ARM  |||||
+        [s] STATS      [w]│  ENCUMBRANCE AND WARMT[e]│        SPEED: 100        │G   |||||  TORSO   |||||  R LEG  |||||
+ Strength:         8 ( 8) │ head       0+0     (  0) │      MOVE COST: 100      │d: 0       Mood: :|       Focus: 100
+ Dexterity:        8 ( 8) │ eyes       0+0     (  0) │                          │: |||||    Speed: 100     Move: 0(W)
+ Intelligence:     8 ( 8) │ mouth      0+0     (  0) │                          │ 8         Dex: 8         Power: --
+ Perception:       8 ( 8) │ torso      0+0     (  0) │                          │ 8         Per: 8         Safe: On
+ Weight:       Overweight │ arms       0+0     (  0) │                          │iness: Fresh      Activity: None
+ Lifestyle:     Feel Fine │ hands      0+0     (  0) │                          │sition: |||||     Weary Malus: +  0%
+ Height:             5'9" │ legs       4+0     (  0) │                          │:                 Thirst:
+ Age:            25 years │ feet       2+0     (  0) │                          │:                 Hunger:
+ Blood type:           O+ │                          │                          │: Comfortable     Weight: Overweight
+──────────────────────────┴──────────────────────────┴──────────────────────────┤r:    None              ┼───FFFFF#####
+ Strength affects your melee damage, the amount of weight you can carry, your   │e:   evac shelter A-23  │<H^FFFF┌┘F###
+ total HP, your resistance to many diseases, and the effectiveness of actions   │ting: very dark         │gH.vOg+│FF###
+ which require brute force.                                                     │her:  Mist              ┴──────┼┴┐F┌##
+ Base HP: 86                                                                    │:                       .nn^^^^│F└T###
+ Carry weight (lbs): 99.2                                                       │:     New moon
+ Bash damage: 6.0                                                               │:     Thursday, May 20
+──────────────────────────┬──────────────────────────┬──────────────────────────┤:     8:00:00 AM
+          SKILLS       [r]│          TRAITS       [t]│         EFFECTS       [c]│: Calm ⇘          Temperature: -
+       Melee skills      ^│ Eye color: brown         ├──────────────────────────┤en: |.........
+ melee:           0 ( 0%)││ Hair: gray, short withou…│    [p] PROFICIENCIES  [v]│d: fists
+ unarmed combat:  0 ( 0%)││ Skin tone: bronze        │ Driving                  │e: No style
+ bashing weapons: 0 ( 0%)│├──────────────────────────┤ Food Preparation         │           N:             NE:
+ cutting weapons: 0 ( 0%)││         BIONICS       [x]├──────────────────────────┘           @              E:
+ piercing weapons:0 ( 0%)││ Power: 0 mJ / 0 kJ       │                       SW:            S:             SE:
+ dodging:     4.0/0 ( 0%)│├──────────────────────────┘                       @ Gerry 'Parch' Linder
+      Ranged skills      ││
+ marksmanship:    0 ( 0%)││
+ throwing:        0 ( 0%)││                                                  Weight :  3.5/99.2 lbs
+ archery:         0 ( 0%)││
+ handguns:        0 ( 0%)││
+ submachine guns: 0 ( 0%)││
+ rifles:          0 ( 0%)││
+ shotguns:        0 ( 0%)││                                                  You lost the conduct "Nudist".
+ launchers:       0 ( 0%)││                                                  You have survived the initial wave of
+     Crafting skills     ││                                                  panic, and have achieved (relative) safety
+ survival:        0 ( 0%)││                                                  in one of the many government evac
+ food handling:   1 ( 0%)││                                                  shelters.
+ fabrication:     1 ( 0%)v│                                                  There is nothing to pick up nearby.

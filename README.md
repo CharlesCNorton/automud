@@ -114,9 +114,11 @@ threats), never the tilemap. Ask for spatial detail when you want it: `send look
 `send examine <dir>`, `send nearby`.
 
 **Actions, not raw keys.** `send` understands word directions (`north`, `se`), named
-keys (`enter`, `escape`), and named game actions (`examine`, `pickup`, `eat`, `wait`,
-`wield`, ...) that map to the right key. An unrecognized word is reported, not typed out
-letter by letter. Single characters are still sent literally, so raw CDDA keys work too.
+keys (`enter`, `escape`), and named game actions (`examine`, `wield`, `wear`, ...) that
+map to the right key. `pickup [NAME]`, `eat [NAME]`, `sleep [HOURS]` and `wait <SPEC>`
+drive their whole multi-prompt flow to completion rather than just opening the menu, and
+report what happened. An unrecognized word is reported, not typed out letter by letter;
+single characters are still sent literally, so raw CDDA keys work too.
 
 **Character creation is one line per choice.** `send newgame` drives the whole
 pre-chargen main menu (a maze with no readable cursor where New Game and World look
