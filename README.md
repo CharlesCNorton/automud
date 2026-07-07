@@ -118,9 +118,12 @@ keys (`enter`, `escape`), and named game actions (`examine`, `pickup`, `eat`, `w
 `wield`, ...) that map to the right key. An unrecognized word is reported, not typed out
 letter by letter. Single characters are still sent literally, so raw CDDA keys work too.
 
-**Character creation is one line per choice.** The finicky chargen menus are wrapped:
+**Character creation is one line per choice.** `send newgame` drives the whole
+pre-chargen main menu (a maze with no readable cursor where New Game and World look
+identical) to the character-creation screen, and each choice is its own verb:
 
 ```
+automud send newgame                             # main menu -> character creation
 automud send scenario Sheltered
 automud send profession "Sheltered Survivor"    # or: send class ...
 automud send stats 8 10 10 10                    # STR DEX INT PER; reports the real values

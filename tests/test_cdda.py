@@ -50,6 +50,23 @@ class TestModeDetection(unittest.TestCase):
     def test_confirm(self):
         self.assertEqual(cd.detect_mode("Are you sure? [Y]es  [N]o"), "confirm")
 
+    def test_world_select(self):
+        self.assertEqual(cd.detect_mode("World selection\nPick a world to enter game"),
+                         "world_select")
+
+    def test_world_manage(self):
+        raw = "Manage world 'Duarte'\n m Show World Mods\n d Delete World"
+        self.assertEqual(cd.detect_mode(raw), "world_manage")
+
+    def test_dropdown_option_is_not_the_create_dialog(self):
+        # The main-menu dropdown lists "Create World" as an option; that must read as the
+        # menu, not as the actual Create-World dialog (which has a World name field). This
+        # distinction is what lets newgame navigate the menu instead of stalling.
+        dropdown = "[MOTD]  [New Game]  [Load]\n Create World\n Duarte (0)"
+        self.assertEqual(cd.detect_mode(dropdown), "main_menu")
+        dialog = "Create World\nWorld name: Duarte\n[f][ Finish ]"
+        self.assertEqual(cd.detect_mode(dialog), "world_create")
+
 
 class TestGameObscuring(unittest.TestCase):
     def setUp(self):

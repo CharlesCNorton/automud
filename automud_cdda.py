@@ -370,11 +370,17 @@ def detect_mode(text: str) -> str:
         return "surroundings"
     if "What to do with" in text or "What do you want to do" in text:
         return "overlay"
+    if "Pick a world to enter game" in text or "World selection" in text:
+        return "world_select"
+    if "Show World Mods" in text or "Manage world" in text or "Delete World" in text:
+        return "world_manage"
+    # The real Create-World dialog has the World name field; the main-menu dropdown merely
+    # lists "Create World" as an option and must not be mistaken for it.
+    if "World name" in text and ("Finish" in text or "Difficulty" in text):
+        return "world_create"
     if ("Custom Character" in text or "Play Now" in text
             or ("[New Game]" in text and "[Load]" in text)):
         return "main_menu"
-    if "Create World" in text or ("World name" in text and "Finish" in text):
-        return "world_create"
     if _looks_like_popup(text):
         return "popup"
     return "game"
@@ -1146,6 +1152,106 @@ def chargen_finalize(expect_scenario: Optional[str] = None,
     return {"ok": True, "mode": detect_mode(auto_clear(raw))}
 
 
+# ------------------------------------------------------------------- main-menu -> chargen
+
+def _escape_to_main_menu(max_steps: int = 8) -> str:
+    """Back out of any submenu to the main menu. A quit/finish confirm (which Escape at
+    the main menu raises) is DECLINED with N, so this never quits the game."""
+    for _ in range(max_steps):
+        raw = capture_raw()
+        mode = detect_mode(raw)
+        if mode == "main_menu":
+            return raw
+        if mode == "confirm":
+            send_keys("N")
+            wait_for_change(before=raw, timeout=1.0)
+            continue
+        if mode == "world_manage":                # this menu's back-out is 'q', not Escape
+            send_keys("q")
+            wait_for_change(before=raw, timeout=1.0)
+            continue
+        send_keys("Escape")
+        wait_for_change(before=raw, timeout=1.0)
+    return capture_raw()
+
+
+def newgame_reach_chargen(max_steps: int = 60) -> str:
+    """Drive the main-menu maze to character creation. The menu gives no readable cursor,
+    and New Game and World show an IDENTICAL world dropdown, so the only way to tell the
+    top items apart is by what Enter opens. This probes and homes:
+
+      - Enter the active top item and classify the result.
+      - New Game opens the 'Pick a world' popup (world_select) -> success, drill in.
+      - World opens 'Manage world' (world_manage); Load opens a load list. Both sit to the
+        RIGHT of New Game, so step LEFT toward it. A MOTD/other popup sits to the LEFT, so
+        step RIGHT. New Game lies between them, so this converges without ever Entering
+        Tutorial or Quit.
+      - world_select : Enter plays the highlighted world.
+      - world_create : Finish (f) + confirm (Y), for a first run with no world yet.
+      - loading      : wait; missing-mod / debug popups are cleared by auto_clear.
+
+    Returns the chargen capture, or raises if it cannot get there."""
+    _escape_to_main_menu()
+    for _ in range(max_steps):
+        raw = auto_clear(capture_raw())
+        mode = detect_mode(raw)
+        text = strip_ansi(raw)
+        if mode in ("chargen", "chargen_traits"):
+            return raw
+        if mode == "loading":
+            time.sleep(0.6)
+            continue
+        if mode == "world_select":
+            send_keys("Enter")
+            wait_for_change(before=raw, timeout=2.5)
+            continue
+        if mode == "world_create":
+            send_keys("f")
+            r = wait_for_change(before=raw, timeout=1.5)
+            if detect_mode(r) == "confirm":
+                send_keys("Y")
+                wait_for_change(before=r, timeout=2.5)
+            continue
+        if mode == "world_manage":                # World is right of New Game: go left
+            _escape_to_main_menu()
+            send_keys("Left")
+            time.sleep(0.1)
+            continue
+        if "Custom Character" in text and "Play Now" in text and mode != "main_menu":
+            for _ in range(6):                    # anchor top of the build list = Custom
+                send_keys("Up")
+                time.sleep(0.04)
+            send_keys("Enter")
+            wait_for_change(timeout=2.0)
+            continue
+        if mode == "main_menu":
+            send_keys("Enter")                    # probe the active top item
+            wait_for_change(before=raw, timeout=2.0)
+            time.sleep(0.3)                        # let the opened screen settle before reading
+            after = auto_clear(capture_raw())
+            am = detect_mode(after)
+            at = strip_ansi(after).lower()
+            if (am in ("world_select", "world_create", "loading")
+                    or am.startswith("chargen")):
+                continue                          # New Game found; outer loop drills in
+            if am == "world_manage" or "characters to load" in at or "load character" in at:
+                _escape_to_main_menu()            # World / Load: New Game is to the left
+                send_keys("Left")
+                time.sleep(0.1)
+            elif am == "main_menu":               # Enter opened nothing readable: nudge left
+                send_keys("Left")
+                time.sleep(0.1)
+            else:                                 # MOTD / other popup: New Game is to the right
+                _escape_to_main_menu()
+                send_keys("Right")
+                time.sleep(0.1)
+            continue
+        _escape_to_main_menu()                    # unknown popup: back out and nudge left
+        send_keys("Left")
+        time.sleep(0.1)
+    raise CddaError("could not reach character creation within the step budget")
+
+
 # --------------------------------------------------------------------------- automud API
 #
 # These are what automud.py's verbs call once a session's backend is "cdda". They reuse
@@ -1307,8 +1413,9 @@ def _act_help(args: List[str], json_mode: bool) -> int:
         "named_keys": ", ".join(sorted(NAMED_KEYS)),
         "info": "look/nearby for surroundings, state for vitals, examine <dir>, "
                 "pickup, eat, wait, sleep. Single letters are sent literally.",
-        "chargen": "scenario NAME | profession NAME | background NAME | "
-                   "stats STR DEX INT PER | trait NAME | name NAME | finalize",
+        "chargen": "newgame (menu -> character creation) | scenario NAME | "
+                   "profession NAME | background NAME | stats STR DEX INT PER | "
+                   "trait NAME | name NAME | finalize",
         "text_entry": "type WORDS  (types literal text into an input prompt)",
     }
     return _emit_action(result, json_mode, "[help]")
@@ -1376,9 +1483,20 @@ def _act_finalize(args: List[str], json_mode: bool) -> int:
     return _emit_action(res, json_mode, "[finalize]")
 
 
+def _act_newgame(args: List[str], json_mode: bool) -> int:
+    try:
+        newgame_reach_chargen()
+    except CddaError as exc:
+        return _emit_action({"ok": False, "reason": str(exc)}, json_mode, "[newgame]")
+    summary = chargen_summary()
+    summary["ok"] = str(summary.get("mode", "")).startswith("chargen")
+    return _emit_action(summary, json_mode, "[newgame]")
+
+
 # High-level send actions that take arguments and return a structured result rather than
 # driving raw keys. These are what make class/stat/scenario selection a one-liner.
 _SPECIAL_ACTIONS = {
+    "newgame": lambda a, j: _act_newgame(a, j),
     "nearby": lambda a, j: _act_nearby(a, j),
     "surroundings": lambda a, j: _act_nearby(a, j),
     "help": lambda a, j: _act_help(a, j),

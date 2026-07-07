@@ -71,7 +71,7 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 
 # ------------------------------ state directory ------------------------------
