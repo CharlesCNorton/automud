@@ -172,6 +172,49 @@ class TestDialogue(unittest.TestCase):
         self.assertNotIn("Faction succession", self.text)
 
 
+class TestInventory(unittest.TestCase):
+    def setUp(self):
+        self.text = "\n".join(cd.parse(load("inventory120.txt"), "inventory"))
+
+    def test_items_present(self):
+        for item in ("smartphone", "long-sleeved shirt", "sneakers", "wallet"):
+            self.assertIn(item, self.text)
+
+    def test_no_sidebar_or_message_leak(self):
+        self.assertNotIn("L ARM", self.text)
+        self.assertNotIn("Sound:", self.text)
+        self.assertNotIn("Nudist", self.text)     # the message log below the box
+
+
+class TestOverlayMenu(unittest.TestCase):
+    def setUp(self):
+        self.lines = cd.parse(load("overlay120.txt"), "overlay")
+        self.text = "\n".join(self.lines)
+
+    def test_question_and_options(self):
+        self.assertIn("What do you want to do?", self.text)
+        self.assertTrue(any("Talk to" in ln for ln in self.lines))
+        self.assertTrue(any(ln.strip() == "a Yell" for ln in self.lines))
+
+    def test_no_sidebar_or_map_leak(self):
+        self.assertNotIn("L ARM", self.text)
+        self.assertNotIn("Sound:", self.text)
+        for ln in self.lines:
+            self.assertFalse(all(c in cd.MAP_CHARS or c == " " for c in ln) and ln.strip())
+
+
+class TestRejoinWrapped(unittest.TestCase):
+    def test_article_keeps_space(self):
+        # "support a" + "roof" must not collapse to "aroof".
+        self.assertEqual(cd._rejoin_wrapped(["beams that support a", "roof."]),
+                         ["beams that support a roof."])
+
+    def test_midword_split_rejoined(self):
+        # A genuine mid-word break still rejoins with no space.
+        self.assertEqual(cd._rejoin_wrapped(["strangely v", "icious"]),
+                         ["strangely vicious"])
+
+
 class TestTokenVocabulary(unittest.TestCase):
     def test_directions(self):
         self.assertEqual(cd._token_key("north"), "k")

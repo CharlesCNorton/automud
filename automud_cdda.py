@@ -301,7 +301,11 @@ def _rejoin_wrapped(lines: List[str]) -> List[str]:
         if not line:
             continue
         prev = out[-1]
-        if len(prev) >= 2 and prev[-2] == " " and prev[-1].isalpha() and line[0].islower():
+        # A line ending in " <single letter>" is usually a word ncurses broke mid-word
+        # ("strangely v" + "icious"), which rejoins with no space. But "a"/"A"/"I" are
+        # whole words, so "support a" + "roof" must stay "support a roof", not "aroof".
+        if (len(prev) >= 2 and prev[-2] == " " and prev[-1].isalpha()
+                and prev[-1] not in "aAI" and line[0].islower()):
             out[-1] = prev + line
         elif line[0].islower() or line[0] in ",.;:!?)'\"":
             out[-1] += " " + line
@@ -763,6 +767,41 @@ def _parse_panel(raw: str) -> List[str]:
     return _rejoin_wrapped(_unique(out))
 
 
+def _parse_overlay(raw: str) -> List[str]:
+    """The in-grid NPC interaction / 'what to do with' menu. Unlike dialogue it has no
+    border: the options sit in a middle column between the left map and the right sidebar.
+    Anchor on the question and keep a column window around it, so the map and the sidebar
+    (both outside that window) fall away and only the question and its keyed options
+    remain."""
+    lines = raw.split("\n")
+    header_col = None
+    for line in lines:
+        plain = strip_ansi(line)
+        i = plain.find("What do you want to do")
+        if i < 0:
+            i = plain.find("What to do with")
+        if i >= 0:
+            header_col = i
+            break
+    lo = max(0, header_col - 2) if header_col is not None else 0
+    hi = header_col + 45 if header_col is not None else 200
+    out = []
+    for line in lines:
+        window = strip_ansi(line)[lo:hi]
+        qm = re.search(r"(What (?:do you want to do|to do with[^?]*)\?)", window)
+        if qm:
+            out.append(qm.group(1))
+        for seg in re.split(r" {2,}", window):
+            seg = seg.strip()
+            if not seg or is_map_segment(seg) or "?" in seg:
+                continue
+            if seg in _HP_PARTS or (":" in seg and seg.split(":")[0].strip() in _LABEL_HEADS):
+                continue                          # a sidebar HP part / labelled field
+            if re.match(r"^[A-Za-z0-9]\s+[A-Z]", seg) and len(seg) <= 55:
+                out.append(seg)                   # a keyed menu option: "t Talk to ..."
+    return _unique(out)
+
+
 def _parse_loading(raw: str) -> List[str]:
     out = []
     for line in raw.split("\n"):
@@ -787,10 +826,14 @@ def parse(raw: str, mode: str) -> List[str]:
         return _parse_loading(raw)
     if mode == "surroundings":
         return _parse_surroundings(raw)
-    if mode in ("dialogue", "overlay"):
+    if mode == "overlay":
+        return _parse_overlay(raw)
+    # dialogue / inventory / look render in a box laid over the game with the sidebar and
+    # message log around it; slice to the box interior to drop them.
+    if mode in ("dialogue", "inventory", "look"):
         return _parse_panel(raw)
-    # look, inventory, popup, pause_menu, world_create, mod_prompt, debug_popup,
-    # extended, keybindings: all clean bordered panels.
+    # popup, pause_menu, world_create, mod_prompt, debug_popup, extended, keybindings:
+    # clean full-screen bordered panels.
     return extract_boxed(raw)
 
 
