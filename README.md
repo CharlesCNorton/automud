@@ -124,6 +124,7 @@ identical) to the character-creation screen, and each choice is its own verb:
 
 ```
 automud send newgame                             # main menu -> character creation
+automud send options profession                  # list every choice on a tab (they scroll)
 automud send scenario Sheltered
 automud send profession "Sheltered Survivor"    # or: send class ...
 automud send stats 8 10 10 10                    # STR DEX INT PER; reports the real values
@@ -134,7 +135,9 @@ automud send finalize
 
 Each reports what it actually committed (and refuses a locked or mismatched entry rather
 than silently selecting the wrong one), and in chargen `state` returns the build so far
-(scenario, profession, stats, name). The missing-mod prompts a fresh world throws are
+(scenario, profession, stats, name). Since the option lists are long and scroll off
+screen (roughly 60 scenarios, 175 professions, 120 backgrounds, 200 traits), `send
+options [TAB]` enumerates every choice on a tab so nothing is hidden below the fold. The missing-mod prompts a fresh world throws are
 cleared automatically.
 
 ## Behaviour

@@ -1104,6 +1104,162 @@ def trait_toggle(name: str) -> Dict[str, Any]:
             "reason": "trait not found in either pane"}
 
 
+def _strip_list_markers(seg: str) -> str:
+    seg = re.sub(r"^[\^v»>]+\s*", "", seg)   # leading scroll / selection markers
+    seg = re.sub(r"\s*[\^v]$", "", seg)           # trailing scroll marker
+    return seg.strip()
+
+
+def _list_divider_col(lines: List[str]) -> Optional[int]:
+    for line in lines:
+        i = line.find(BOX_VERT, 40)
+        if 40 <= i <= 74:
+            return i
+    return None
+
+
+def _visible_list_entries(raw: str) -> List[str]:
+    """Option names in the left list column of a single-column chargen tab (SCENARIO /
+    PROFESSION / BACKGROUND / SKILLS), for the currently-scrolled window."""
+    lines = raw.split("\n")
+    col = _list_divider_col(lines)
+    out = []
+    seen_summary = False
+    for line in lines:
+        r = line.rstrip()
+        if "Summary" in r and "Lifestyle" in r:
+            seen_summary = True
+            continue
+        if not seen_summary or ("SCENARIO" in r and "PROFESSION" in r):
+            continue
+        seg = _strip_list_markers(_clean(r[:col] if col else r))
+        if seg and any(c.isalpha() for c in seg) and not seg.startswith("Press "):
+            out.append(seg)
+    return out
+
+
+def _visible_trait_columns(raw: str) -> List[List[str]]:
+    """The three trait panes (positive / negative / cosmetic) visible in the current
+    TRAITS window."""
+    cols: List[List[str]] = [[], [], []]
+    seen_summary = False
+    for line in raw.split("\n"):
+        r = line.rstrip()
+        if "Summary" in r and "Lifestyle" in r:
+            seen_summary = True
+            continue
+        if not seen_summary or r.count(BOX_VERT) < 2:
+            continue
+        parts = [_clean(p) for p in r.split(BOX_VERT)]
+        while parts and not parts[0]:
+            parts.pop(0)
+        while parts and not parts[-1]:
+            parts.pop()
+        for i in range(min(3, len(parts))):
+            name = _strip_list_markers(parts[i])
+            if name and any(c.isalpha() for c in name):
+                cols[i].append(name)
+    return cols
+
+
+def _selected_option_name(raw: str) -> Optional[str]:
+    m = re.search(r"Identity:\s*(.+?)(?:\s*\((?:male|female)\)|\s{2,}|$)",
+                  strip_ansi(raw))
+    return m.group(1).strip() if m else None
+
+
+def _walk_options(read_selected, limit: int = 400) -> List[str]:
+    """Enumerate a single-column chargen list exactly and in order. Window scrolling is
+    unreliable (a burst of Down keys is coalesced into ~one move, and page boundaries
+    behave inconsistently), so instead step ONE item at a time - a single Down always
+    moves exactly one - and read the unambiguous selected-item readout each step. Stops
+    when the selection loops back to the first item (the list wrapped = full pass) or
+    stops advancing (bottom of a non-wrapping list)."""
+    seen: List[str] = []
+    stuck = 0
+    for _ in range(limit):
+        raw = capture_raw()
+        cur = read_selected(raw)
+        if not cur:
+            break
+        if cur in seen:
+            if cur == seen[0] and len(seen) > 1:
+                break                             # wrapped to the top: every item seen
+            stuck += 1
+            if stuck >= 3:
+                break                             # not moving: bottom of the list
+        else:
+            seen.append(cur)
+            stuck = 0
+        before = raw
+        send_keys("Down")
+        wait_for_change(before=before, timeout=0.5)
+    return seen
+
+
+def _collect_scrolling(read_window, max_pages: int = 40) -> List[str]:
+    """Every entry in the focused chargen list, gathered without needing to find the top
+    first: page DOWN collecting until the window stops yielding anything new (the bottom),
+    then page UP doing the same (the top). From any starting position the two passes
+    together cover the whole list. Paging uses a single PageDown / PageUp per step: a
+    burst of individual Down keys sent at once is coalesced by the game into roughly one
+    move, so it never actually scrolls. read_window() returns the entries visible now."""
+    seen: List[str] = []
+    for direction in ("PageDown", "PageUp"):
+        stale = 0
+        for _ in range(max_pages):
+            added = 0
+            for entry in read_window():
+                if entry not in seen:
+                    seen.append(entry)
+                    added += 1
+            if added == 0:
+                stale += 1
+                if stale >= 2:
+                    break
+            else:
+                stale = 0
+            before = capture_raw()
+            send_keys(direction)
+            wait_for_change(before=before, timeout=0.7)
+    return seen
+
+
+def chargen_list_options(tab: Optional[str] = None) -> Dict[str, Any]:
+    """Every selectable option on a chargen tab, gathered by scrolling the list top to
+    bottom (the window only shows ~20-30 at a time). Answers "what can I pick here" for
+    the long lists (120 professions, 172 traits) that never fit on one screen."""
+    raw = capture_raw()
+    if not detect_mode(raw).startswith("chargen"):
+        raise CddaError("not in chargen (mode: %s)" % detect_mode(raw))
+    cur = detect_chargen_tab(raw)
+    if tab:
+        tab = tab.upper()
+        if tab != cur and _goto_tab(tab):
+            cur = tab
+    if cur == "STATS":
+        return {"tab": "STATS", "count": 4, "options": list(CHARGEN_STAT_NAMES)}
+    if cur == "TRAITS":
+        panes = {"positive": [], "negative": [], "cosmetic": []}
+        keys = ("positive", "negative", "cosmetic")
+        for _ in range(3):                        # anchor on the leftmost pane
+            send_keys("Left")
+            time.sleep(0.05)
+        for idx in range(3):
+            panes[keys[idx]] = _collect_scrolling(
+                lambda i=idx: _visible_trait_columns(capture_raw())[i])
+            send_keys("Right")                    # advance to the next pane
+            time.sleep(0.1)
+        return {"tab": "TRAITS", "count": sum(len(v) for v in panes.values()), **panes}
+    # SCENARIO / PROFESSION / BACKGROUND expose the selection on the Identity line, so walk
+    # them item by item for an exact, ordered enumeration.
+    if cur in ("SCENARIO", "PROFESSION", "BACKGROUND"):
+        options = _walk_options(_selected_option_name)
+        return {"tab": cur, "count": len(options), "options": options}
+    options = _collect_scrolling(lambda: _visible_list_entries(capture_raw()))
+    return {"tab": cur, "count": len(options), "options": options}
+
+
 def chargen_summary() -> Dict[str, Any]:
     """A parseable snapshot of the character build so far: current tab, the selected
     entry on it, the stat line (always readable), and, by a quick hop to DESCRIPTION, the
@@ -1413,9 +1569,9 @@ def _act_help(args: List[str], json_mode: bool) -> int:
         "named_keys": ", ".join(sorted(NAMED_KEYS)),
         "info": "look/nearby for surroundings, state for vitals, examine <dir>, "
                 "pickup, eat, wait, sleep. Single letters are sent literally.",
-        "chargen": "newgame (menu -> character creation) | scenario NAME | "
-                   "profession NAME | background NAME | stats STR DEX INT PER | "
-                   "trait NAME | name NAME | finalize",
+        "chargen": "newgame (menu -> character creation) | options [TAB] (list every "
+                   "choice) | scenario NAME | profession NAME | background NAME | "
+                   "stats STR DEX INT PER | trait NAME | name NAME | finalize",
         "text_entry": "type WORDS  (types literal text into an input prompt)",
     }
     return _emit_action(result, json_mode, "[help]")
@@ -1483,6 +1639,27 @@ def _act_finalize(args: List[str], json_mode: bool) -> int:
     return _emit_action(res, json_mode, "[finalize]")
 
 
+def _act_options(args: List[str], json_mode: bool) -> int:
+    tab = args[0] if args else None
+    try:
+        res = chargen_list_options(tab)
+    except CddaError as exc:
+        return _emit_action({"ok": False, "reason": str(exc)}, json_mode, "[options]")
+    if json_mode:
+        print(json.dumps({"ok": True, **res}))
+        return 0
+    print("[options] %s (%d)" % (res.get("tab"), res.get("count", 0)))
+    if res.get("tab") == "TRAITS":
+        for pane in ("positive", "negative", "cosmetic"):
+            print("--- %s ---" % pane)
+            for name in res.get(pane, []):
+                print("  " + name)
+    else:
+        for name in res.get("options", []):
+            print("  " + name)
+    return 0
+
+
 def _act_newgame(args: List[str], json_mode: bool) -> int:
     try:
         newgame_reach_chargen()
@@ -1497,6 +1674,8 @@ def _act_newgame(args: List[str], json_mode: bool) -> int:
 # driving raw keys. These are what make class/stat/scenario selection a one-liner.
 _SPECIAL_ACTIONS = {
     "newgame": lambda a, j: _act_newgame(a, j),
+    "options": lambda a, j: _act_options(a, j),
+    "list": lambda a, j: _act_options(a, j),
     "nearby": lambda a, j: _act_nearby(a, j),
     "surroundings": lambda a, j: _act_nearby(a, j),
     "help": lambda a, j: _act_help(a, j),

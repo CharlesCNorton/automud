@@ -204,6 +204,44 @@ class TestTokenVocabulary(unittest.TestCase):
             self.assertIn(action, cd._SPECIAL_ACTIONS)
 
 
+class TestOptionEnumeration(unittest.TestCase):
+    def test_selected_option_name(self):
+        raw = "Identity: Survivor (male) (press @ to switch)"
+        self.assertEqual(cd._selected_option_name(raw), "Survivor")
+        raw2 = "Identity: Sheltered Survivor (female)"
+        self.assertEqual(cd._selected_option_name(raw2), "Sheltered Survivor")
+
+    def test_strip_list_markers(self):
+        self.assertEqual(cd._strip_list_markers("^ Evacuee"), "Evacuee")
+        self.assertEqual(cd._strip_list_markers("» Sheltered"), "Sheltered")
+        self.assertEqual(cd._strip_list_markers("Wilderness v"), "Wilderness")
+
+    def test_visible_list_entries(self):
+        # The list/detail divider sits around column 57 in the real chargen layout.
+        div = 57
+        raw = (
+            "Summary |  Lifestyle: average\n"
+            + "^ Evacuee".ljust(div) + "│ Origin: Dark Days Ahead\n"
+            + "  Sheltered".ljust(div) + "│ Identity: Evacuee (male)\n"
+            + "  Wilderness".ljust(div) + "│ Press # to change date\n")
+        entries = cd._visible_list_entries(raw)
+        self.assertEqual(entries, ["Evacuee", "Sheltered", "Wilderness"])
+
+    def test_visible_trait_columns(self):
+        raw = (
+            "Summary |  Lifestyle: average\n"
+            "│ Fleet-Footed │ Asthmatic │ Eye color │\n"
+            "│ Fast Reader  │ Near-Sighted │ Hair │\n")
+        cols = cd._visible_trait_columns(raw)
+        self.assertIn("Fleet-Footed", cols[0])
+        self.assertIn("Asthmatic", cols[1])
+        self.assertIn("Eye color", cols[2])
+
+    def test_options_action_registered(self):
+        self.assertIn("options", cd._SPECIAL_ACTIONS)
+        self.assertIn("list", cd._SPECIAL_ACTIONS)
+
+
 class TestPureHelpers(unittest.TestCase):
     def test_ascii_only_strips_arrows(self):
         self.assertEqual(cd._ascii_only("Calm ⇗"), "Calm")
